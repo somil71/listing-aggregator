@@ -71,3 +71,19 @@ CREATE INDEX IF NOT EXISTS idx_listings_confidence ON listings(extraction_confid
 
 CREATE INDEX IF NOT EXISTS idx_digests_date ON digests(digest_date DESC);
 CREATE INDEX IF NOT EXISTS idx_notes_listing ON listing_notes(listing_id);
+
+-- Users for authentication
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Scraper status tracking
+CREATE TABLE IF NOT EXISTS scraper_status (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  status TEXT DEFAULT 'disconnected', -- disconnected, connecting, qr_ready, authenticated
+  qr_code TEXT, -- Store the latest QR string
+  last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+);

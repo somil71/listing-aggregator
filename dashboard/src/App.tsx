@@ -1,213 +1,224 @@
 import React, { useEffect, useState } from 'react';
 import axios from 'axios';
-import { Search, MapPin, IndianRupee, Bed, Phone, ExternalLink, Filter, Home, LayoutDashboard, Car, Sofa, Ruler, TrendingUp } from 'lucide-react';
+import { Search, MapPin, Bed, Phone, ExternalLink, Home, LayoutDashboard, Car, Sofa, Ruler, TrendingUp, Lock, LogOut, User, QrCode, AlertCircle } from 'lucide-react';
+import QRCode from 'qrcode';
+
+// Set axios defaults for credentials
+axios.defaults.withCredentials = true;
 
 interface Listing {
-  id: string;
-  price: number | null;
-  location: string | null;
-  bedrooms: number | null;
-  property_type: string;
-  area_sqft: number | null;
-  furnished: number | null;
-  parking: number | null;
-  description: string;
-  agent_phone: string | null;
-  agent_name: string | null;
-  group_name: string;
-  created_at: string;
-  extraction_confidence: number | null;
-}
-
-interface Statistics {
-  avg_price?: number;
-  min_price?: number;
-  max_price?: number;
-  avg_bedrooms?: number;
-  avg_area?: number;
+  id: string; price: number | null; location: string | null; bedrooms: number | null;
+  property_type: string; area_sqft: number | null; furnished: number | null;
+  parking: number | null; description: string; agent_phone: string | null;
+  group_name: string; created_at: string; extraction_confidence: number | null;
 }
 
 function App() {
+  const [user, setUser] = useState<{ email: string } | null>(null);
+  const [view, setView] = useState<'login' | 'dashboard' | 'scraper'>('login');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [listings, setListings] = useState<Listing[]>([]);
-  const [stats, setStats] = useState<Statistics>({});
-  const [loading, setLoading] = useState(true);
+  const [stats, setStats] = useState<any>({});
+  const [loading, setLoading] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedListing, setSelectedListing] = useState<Listing | null>(null);
+  const [scraperStatus, setScraperStatus] = useState<any>(null);
+  const [qrUrl, setQrUrl] = useState<string | null>(null);
 
   useEffect(() => {
-    fetchListings();
+    checkAuth();
   }, []);
+
+  const checkAuth = async () => {
+    try {
+      const res = await axios.get('/api/auth/me');
+      setUser(res.data.user);
+      setView('dashboard');
+      fetchListings();
+    } catch {
+      setView('login');
+    }
+  };
+
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      await axios.post('/api/auth/login', { email, password });
+      checkAuth();
+    } catch (err) {
+      alert('Invalid credentials');
+    }
+  };
+
+  const handleLogout = async () => {
+    await axios.post('/api/auth/logout');
+    setUser(null);
+    setView('login');
+  };
 
   const fetchListings = async () => {
     setLoading(true);
     try {
-      const response = await axios.get('/api/listings/today');
-      setListings(response.data.data.listings);
-      setStats(response.data.data.statistics || {});
-    } catch (error) {
-      console.error('Error fetching listings:', error);
+      const res = await axios.get('/api/listings/today');
+      setListings(res.data.data.listings);
+      setStats(res.data.data.statistics);
+    } catch (err) {
+      console.error(err);
     } finally {
       setLoading(false);
     }
   };
 
-  const filteredListings = listings.filter(l =>
-    l.description.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    (l.location && l.location.toLowerCase().includes(searchTerm.toLowerCase())) ||
-    (l.group_name && l.group_name.toLowerCase().includes(searchTerm.toLowerCase()))
-  );
-
-  const formatPrice = (price: number | undefined | null) => {
-    if (price === undefined || price === null) return 'N/A';
-    if (price >= 10000000) return `₹${(price / 10000000).toFixed(2)} Cr`;
-    if (price >= 100000) return `₹${(price / 100000).toFixed(2)} L`;
-    return `₹${price.toLocaleString()}`;
+  const fetchScraperStatus = async () => {
+    try {
+      const res = await axios.get('/api/scraper/status');
+      setScraperStatus(res.data.data);
+      if (res.data.data.qr_code) {
+        const url = await QRCode.toDataURL(res.data.data.qr_code);
+        setQrUrl(url);
+      } else {
+        setQrUrl(null);
+      }
+    } catch (err) {
+      console.error(err);
+    }
   };
 
-  return (
-    <div className="min-h-screen flex flex-col md:flex-row bg-slate-50">
-      {/* Sidebar */}
-      <aside className="w-full md:w-64 bg-white border-r p-6 hidden md:block">
-        <div className="flex items-center gap-2 font-bold text-xl mb-8 text-blue-600">
-          <Home className="w-6 h-6" />
-          <span>PropDigest</span>
-        </div>
+  useEffect(() => {
+    if (view === 'scraper') {
+      fetchScraperStatus();
+      const interval = setInterval(fetchScraperStatus, 5000);
+      return () => clearInterval(interval);
+    }
+  }, [view]);
 
-        <nav className="space-y-2">
-          <button className="flex items-center gap-3 w-full p-2 rounded-lg bg-blue-50 text-blue-600 font-medium text-left">
-            <LayoutDashboard className="w-5 h-5" />
-            Dashboard
+  if (view === 'login') {
+    return (
+      <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4">
+        <div className="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-md">
+          <div className="flex flex-col items-center mb-8">
+            <div className="bg-blue-600 p-3 rounded-xl mb-4">
+              <Lock className="text-white w-8 h-8" />
+            </div>
+            <h1 className="text-2xl font-bold text-slate-900">Property Digest Secure</h1>
+            <p className="text-slate-500 text-sm">Sign in to access daily listings</p>
+          </div>
+          <form onSubmit={handleLogin} className="space-y-4">
+            <div>
+              <label className="block text-sm font-bold text-slate-700 mb-1">Email</label>
+              <input type="email" value={email} onChange={e => setEmail(e.target.value)} className="w-full p-3 border rounded-xl focus:ring-2 focus:ring-blue-500 outline-none" required />
+            </div>
+            <div>
+              <label className="block text-sm font-bold text-slate-700 mb-1">Password</label>
+              <input type="password" value={password} onChange={e => setPassword(e.target.value)} className="w-full p-3 border rounded-xl focus:ring-2 focus:ring-blue-500 outline-none" required />
+            </div>
+            <button type="submit" className="w-full bg-blue-600 text-white py-3 rounded-xl font-bold hover:bg-blue-700 transition-colors shadow-lg">Login</button>
+          </form>
+          <p className="text-center text-xs text-slate-400 mt-6 font-medium uppercase tracking-widest">Authorized Access Only</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen flex bg-slate-50 font-sans">
+      {/* Sidebar */}
+      <aside className="w-64 bg-slate-900 text-slate-300 p-6 flex flex-col fixed inset-y-0 z-20">
+        <div className="flex items-center gap-3 font-black text-2xl mb-12 text-white italic">
+          <Home className="w-8 h-8 text-blue-500" />
+          <span>PROPDIGEST</span>
+        </div>
+        <nav className="space-y-2 flex-1">
+          <button onClick={() => setView('dashboard')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-all ${view === 'dashboard' ? 'bg-blue-600 text-white shadow-lg' : 'hover:bg-slate-800'}`}>
+            <LayoutDashboard className="w-5 h-5" /> Dashboard
           </button>
-          <div className="pt-4 pb-2 text-xs font-semibold text-slate-400 uppercase tracking-wider">
-            Filters
-          </div>
-          <div className="space-y-4">
-             <div className="text-sm text-slate-600">Confidence Score &gt; 50%</div>
-          </div>
+          <button onClick={() => setView('scraper')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-all ${view === 'scraper' ? 'bg-blue-600 text-white shadow-lg' : 'hover:bg-slate-800'}`}>
+            <QrCode className="w-5 h-5" /> Scraper Status
+          </button>
         </nav>
+        <div className="pt-6 border-t border-slate-800 space-y-4">
+          <div className="flex items-center gap-2 px-2">
+            <User className="w-4 h-4 text-blue-500" />
+            <span className="text-sm font-bold truncate">{user?.email}</span>
+          </div>
+          <button onClick={handleLogout} className="flex items-center gap-3 w-full p-3 rounded-xl text-red-400 hover:bg-red-500/10 transition-colors font-bold">
+            <LogOut className="w-5 h-5" /> Logout
+          </button>
+        </div>
       </aside>
 
       {/* Main Content */}
-      <main className="flex-1 flex flex-col overflow-hidden">
-        {/* Header */}
-        <header className="h-16 bg-white border-b px-6 flex items-center justify-between sticky top-0 z-10">
-          <div className="relative w-full max-w-md">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
-            <input
-              type="text"
-              placeholder="Search by area, description, or group..."
-              className="w-full pl-10 pr-4 py-2 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-            />
+      <main className="ml-64 flex-1 flex flex-col min-h-screen">
+        <header className="h-20 bg-white border-b px-8 flex items-center justify-between sticky top-0 z-10">
+          <div className="relative w-full max-w-xl">
+            <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" />
+            <input type="text" placeholder="Search areas, configs, agents..." className="w-full pl-12 pr-6 py-3 bg-slate-100 border-none rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none font-medium" value={searchTerm} onChange={e => setSearchTerm(e.target.value)} />
           </div>
-          <div className="flex items-center gap-4">
-             <span className="text-sm text-slate-500 hidden sm:inline">Updated just now</span>
-             <button onClick={fetchListings} className="p-2 hover:bg-slate-100 rounded-full transition-colors">
-                <LayoutDashboard className="w-5 h-5 text-slate-600" />
-             </button>
-          </div>
+          <button onClick={fetchListings} className="bg-blue-600 text-white px-6 py-3 rounded-2xl font-black text-sm shadow-lg hover:bg-blue-700 transition-all active:scale-95">REFRESH</button>
         </header>
 
-        {/* Content Area */}
-        <div className="flex-1 overflow-auto p-6">
-          <div className="max-w-6xl mx-auto">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between mb-6 gap-4">
-              <h1 className="text-2xl font-bold text-slate-900">Today's Real Estate Digest</h1>
-              <div className="flex gap-2">
-                <span className="bg-blue-100 text-blue-700 px-3 py-1 rounded-full text-sm font-semibold border border-blue-200">
-                  {filteredListings.length} Active Listings
-                </span>
-              </div>
-            </div>
-
-            {/* Stats */}
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-              <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200 hover:shadow-md transition-shadow">
-                <div className="text-slate-500 text-sm font-medium">Avg Market Price</div>
-                <div className="text-3xl font-bold mt-1 text-slate-900">{formatPrice(stats.avg_price)}</div>
-                <div className="text-xs text-slate-400 mt-2 flex items-center gap-1">
-                   <TrendingUp className="w-3 h-3 text-green-500" /> From {listings.length} listings today
+        <div className="p-8">
+          {view === 'dashboard' ? (
+            <div className="max-w-7xl mx-auto space-y-8">
+              <div className="flex items-end justify-between">
+                <div>
+                  <h1 className="text-4xl font-black text-slate-900 tracking-tighter uppercase">Market Pulse</h1>
+                  <p className="text-slate-500 font-bold mt-1 uppercase text-xs tracking-widest">Real-time property insights for {new Date().toLocaleDateString()}</p>
                 </div>
               </div>
-              <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200 hover:shadow-md transition-shadow">
-                <div className="text-slate-500 text-sm font-medium">Avg Configuration</div>
-                <div className="text-3xl font-bold mt-1 text-green-600">{stats.avg_bedrooms?.toFixed(1) || '0.0'} BHK</div>
-                <div className="text-xs text-slate-400 mt-2">Typical property size</div>
-              </div>
-              <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200 hover:shadow-md transition-shadow">
-                <div className="text-slate-500 text-sm font-medium">Avg Area</div>
-                <div className="text-3xl font-bold mt-1 text-blue-600">{stats.avg_area?.toFixed(0) || '0'} sqft</div>
-                <div className="text-xs text-slate-400 mt-2">Space efficiency</div>
-              </div>
-            </div>
 
-            {/* List */}
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-              <div className="overflow-x-auto">
-                <table className="w-full text-left">
-                  <thead className="bg-slate-50 border-b border-slate-200">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-200">
+                  <div className="text-xs font-black text-slate-400 uppercase tracking-widest mb-2">Avg Market Price</div>
+                  <div className="text-3xl font-black text-slate-900">₹{(stats.avg_price / 10000000 || 0).toFixed(2)} Cr</div>
+                  <div className="mt-4 flex items-center gap-2 text-green-600 font-bold text-xs"><TrendingUp className="w-4 h-4" /> Healthy Volume</div>
+                </div>
+                <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-200">
+                  <div className="text-xs font-black text-slate-400 uppercase tracking-widest mb-2">Avg Configuration</div>
+                  <div className="text-3xl font-black text-slate-900">{(stats.avg_bedrooms || 0).toFixed(1)} BHK</div>
+                  <div className="mt-4 text-slate-400 font-bold text-xs">Standard Luxury Segment</div>
+                </div>
+                <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-200">
+                  <div className="text-xs font-black text-slate-400 uppercase tracking-widest mb-2">Total Listings</div>
+                  <div className="text-3xl font-black text-blue-600">{listings.length}</div>
+                  <div className="mt-4 text-slate-400 font-bold text-xs">Across 15+ Premium Groups</div>
+                </div>
+              </div>
+
+              <div className="bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden">
+                <table className="w-full">
+                  <thead className="bg-slate-50 border-b">
                     <tr>
-                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-wider">Price</th>
-                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-wider">Details</th>
-                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-wider">Group & Agent</th>
-                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-wider text-right">Actions</th>
+                      <th className="px-8 py-5 text-[10px] font-black text-slate-400 uppercase tracking-widest text-left">Property Details</th>
+                      <th className="px-8 py-5 text-[10px] font-black text-slate-400 uppercase tracking-widest text-left">Configuration</th>
+                      <th className="px-8 py-5 text-[10px] font-black text-slate-400 uppercase tracking-widest text-left">Pricing</th>
+                      <th className="px-8 py-5 text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">Action</th>
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-slate-200">
-                    {loading ? (
-                      <tr><td colSpan={4} className="px-6 py-12 text-center text-slate-500">
-                        <div className="flex flex-col items-center gap-2">
-                           <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
-                           <span>Fetching today's market...</span>
-                        </div>
-                      </td></tr>
-                    ) : filteredListings.length === 0 ? (
-                      <tr><td colSpan={4} className="px-6 py-12 text-center text-slate-500">No listings found today. Try adjusting your search.</td></tr>
-                    ) : filteredListings.map(listing => (
-                      <tr
-                        key={listing.id}
-                        className="hover:bg-blue-50/50 cursor-pointer transition-colors group"
-                        onClick={() => setSelectedListing(listing)}
-                      >
-                        <td className="px-6 py-5">
-                          <div className="font-extrabold text-blue-600 text-lg">{formatPrice(listing.price)}</div>
-                          <div className="text-xs text-slate-400 mt-1 uppercase font-bold tracking-tighter">
-                            {listing.property_type}
-                          </div>
-                        </td>
-                        <td className="px-6 py-5">
-                          <div className="flex flex-col gap-1.5">
-                            <div className="flex items-center gap-1.5 font-semibold text-slate-900">
-                              <MapPin className="w-4 h-4 text-slate-400" />
-                              {listing.location || 'Location Not Specified'}
-                            </div>
-                            <div className="flex items-center gap-3 text-sm text-slate-500">
-                              <span className="flex items-center gap-1">
-                                <Bed className="w-4 h-4" /> {listing.bedrooms ? `${listing.bedrooms} BHK` : 'N/A'}
-                              </span>
-                              {listing.area_sqft && (
-                                <span className="flex items-center gap-1">
-                                  <Ruler className="w-4 h-4" /> {listing.area_sqft} sqft
-                                </span>
-                              )}
+                  <tbody className="divide-y divide-slate-100">
+                    {listings.filter(l => l.description.toLowerCase().includes(searchTerm.toLowerCase())).map(l => (
+                      <tr key={l.id} className="hover:bg-slate-50 transition-colors cursor-pointer group" onClick={() => setSelectedListing(l)}>
+                        <td className="px-8 py-6">
+                          <div className="flex items-center gap-3">
+                            <div className="w-12 h-12 bg-blue-100 rounded-2xl flex items-center justify-center text-blue-600 font-black text-xs uppercase">{l.property_type.charAt(0)}</div>
+                            <div>
+                              <div className="font-black text-slate-900 uppercase tracking-tight">{l.location || 'Premium Listing'}</div>
+                              <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{l.group_name}</div>
                             </div>
                           </div>
                         </td>
-                        <td className="px-6 py-5">
-                          <div className="flex flex-col gap-1.5">
-                            <span className="inline-flex w-fit px-2 py-0.5 rounded-md bg-slate-100 text-slate-600 text-[10px] font-bold border uppercase">
-                              {listing.group_name}
-                            </span>
-                            <div className="text-sm text-slate-600 flex items-center gap-1">
-                              <Phone className="w-3 h-3" /> {listing.agent_phone || 'Private Number'}
-                            </div>
+                        <td className="px-8 py-6">
+                          <div className="flex items-center gap-4 text-sm font-bold text-slate-700">
+                            <span className="flex items-center gap-1.5"><Bed className="w-4 h-4 text-slate-300" /> {l.bedrooms || 'N/A'}</span>
+                            <span className="flex items-center gap-1.5"><Ruler className="w-4 h-4 text-slate-300" /> {l.area_sqft || 'N/A'}</span>
                           </div>
                         </td>
-                        <td className="px-6 py-5 text-right">
-                          <button className="bg-white border border-slate-200 text-slate-700 px-4 py-2 rounded-lg text-sm font-bold hover:bg-slate-50 hover:border-blue-300 hover:text-blue-600 transition-all shadow-sm">
-                            View
-                          </button>
+                        <td className="px-8 py-6">
+                          <div className="text-xl font-black text-blue-600 tracking-tighter">₹{(l.price || 0) >= 10000000 ? `${((l.price || 0)/10000000).toFixed(2)} Cr` : `${((l.price || 0)/100000).toFixed(2)} L`}</div>
+                        </td>
+                        <td className="px-8 py-6 text-right">
+                          <button className="bg-slate-100 text-slate-900 px-5 py-2 rounded-xl text-xs font-black hover:bg-blue-600 hover:text-white transition-all">VIEW</button>
                         </td>
                       </tr>
                     ))}
@@ -215,105 +226,73 @@ function App() {
                 </table>
               </div>
             </div>
-          </div>
+          ) : (
+            <div className="max-w-2xl mx-auto space-y-8 py-12">
+              <div className="text-center">
+                <h1 className="text-4xl font-black text-slate-900 tracking-tighter uppercase">Scraper Terminal</h1>
+                <p className="text-slate-500 font-bold mt-2 uppercase text-xs tracking-widest">Connection Status: <span className={scraperStatus?.status === 'authenticated' ? 'text-green-600' : 'text-orange-500'}>{scraperStatus?.status}</span></p>
+              </div>
+
+              {scraperStatus?.status === 'qr_ready' && qrUrl && (
+                <div className="bg-white p-12 rounded-[40px] shadow-2xl border-4 border-blue-600 flex flex-col items-center">
+                  <img src={qrUrl} alt="WhatsApp QR" className="w-64 h-64 mb-8" />
+                  <div className="bg-blue-50 p-6 rounded-2xl flex items-start gap-4">
+                    <AlertCircle className="text-blue-600 w-6 h-6 shrink-0" />
+                    <div>
+                      <h3 className="font-black text-blue-900 uppercase text-sm mb-1">Action Required</h3>
+                      <p className="text-blue-700 text-xs leading-relaxed">Scan this QR code with your dedicated WhatsApp account to start scraping listings. <strong>Note:</strong> This session will expire in 1 minute.</p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {scraperStatus?.status === 'authenticated' && (
+                <div className="bg-white p-12 rounded-[40px] shadow-xl border border-slate-200 text-center">
+                  <div className="w-20 h-20 bg-green-100 text-green-600 rounded-3xl flex items-center justify-center mx-auto mb-6">
+                    <User className="w-10 h-10" />
+                  </div>
+                  <h2 className="text-2xl font-black text-slate-900 uppercase tracking-tight">System Authenticated</h2>
+                  <p className="text-slate-500 text-sm mt-2">The scraper is active and listening for new property messages.</p>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </main>
 
-      {/* Detail Modal */}
+      {/* Detail Modal - same as before but restyled */}
       {selectedListing && (
-        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50 animate-in fade-in duration-200">
-          <div className="bg-white rounded-2xl w-full max-w-2xl max-h-[90vh] overflow-hidden shadow-2xl flex flex-col">
-            <div className="p-6 border-b flex justify-between items-start bg-white">
-              <div className="flex flex-col gap-1">
-                <div className="flex items-center gap-2">
-                   <h2 className="text-2xl font-black text-slate-900">{formatPrice(selectedListing.price)}</h2>
-                   <span className="px-2 py-0.5 rounded bg-blue-100 text-blue-700 text-[10px] font-bold uppercase border border-blue-200">
-                     {selectedListing.property_type}
-                   </span>
+        <div className="fixed inset-0 bg-slate-900/90 backdrop-blur-md flex items-center justify-center p-4 z-50 overflow-auto" onClick={() => setSelectedListing(null)}>
+          <div className="bg-white rounded-[40px] w-full max-w-2xl overflow-hidden shadow-2xl" onClick={e => e.stopPropagation()}>
+            <div className="p-10 space-y-8">
+              <div className="flex justify-between items-start">
+                <div>
+                   <h2 className="text-4xl font-black text-slate-900 tracking-tighter uppercase">₹{(selectedListing.price || 0) >= 10000000 ? `${((selectedListing.price || 0)/10000000).toFixed(2)} Cr` : `${((selectedListing.price || 0)/100000).toFixed(2)} L`}</h2>
+                   <div className="flex items-center gap-2 mt-2 text-slate-500 font-bold uppercase text-xs tracking-widest"><MapPin className="w-4 h-4 text-blue-500" /> {selectedListing.location}</div>
                 </div>
-                <div className="flex items-center gap-1 text-slate-500 font-medium">
-                  <MapPin className="w-4 h-4" />
-                  {selectedListing.location || 'Details from WhatsApp'}
-                </div>
+                <button onClick={() => setSelectedListing(null)} className="w-12 h-12 bg-slate-100 rounded-full flex items-center justify-center text-slate-400 hover:bg-slate-200">✕</button>
               </div>
-              <button
-                onClick={() => setSelectedListing(null)}
-                className="p-2 hover:bg-slate-100 rounded-full text-slate-400 transition-colors"
-              >
-                <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
 
-            <div className="p-8 overflow-y-auto space-y-8">
-              {/* Feature Grid */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-                <div className="p-4 bg-slate-50 rounded-xl border border-slate-100">
-                  <div className="text-[10px] text-slate-400 uppercase font-black mb-1">Configuration</div>
-                  <div className="font-bold text-slate-900 flex items-center gap-1.5">
-                    <Bed className="w-4 h-4 text-blue-500" /> {selectedListing.bedrooms || 'N/A'} BHK
-                  </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="bg-slate-50 p-6 rounded-3xl border border-slate-100">
+                  <div className="text-[10px] font-black text-slate-400 uppercase mb-1">Configuration</div>
+                  <div className="font-black text-slate-900 flex items-center gap-2 text-xl"><Bed className="w-5 h-5 text-blue-600" /> {selectedListing.bedrooms} BHK</div>
                 </div>
-                <div className="p-4 bg-slate-50 rounded-xl border border-slate-100">
-                  <div className="text-[10px] text-slate-400 uppercase font-black mb-1">Area</div>
-                  <div className="font-bold text-slate-900 flex items-center gap-1.5">
-                    <Ruler className="w-4 h-4 text-blue-500" /> {selectedListing.area_sqft || 'N/A'} sqft
-                  </div>
-                </div>
-                <div className="p-4 bg-slate-50 rounded-xl border border-slate-100">
-                  <div className="text-[10px] text-slate-400 uppercase font-black mb-1">Furnishing</div>
-                  <div className="font-bold text-slate-900 flex items-center gap-1.5">
-                    <Sofa className="w-4 h-4 text-blue-500" /> {selectedListing.furnished === 1 ? 'Furnished' : selectedListing.furnished === 0 ? 'Unfurnished' : 'N/A'}
-                  </div>
-                </div>
-                <div className="p-4 bg-slate-50 rounded-xl border border-slate-100">
-                  <div className="text-[10px] text-slate-400 uppercase font-black mb-1">Parking</div>
-                  <div className="font-bold text-slate-900 flex items-center gap-1.5">
-                    <Car className="w-4 h-4 text-blue-500" /> {selectedListing.parking ? 'Available' : 'No'}
-                  </div>
+                <div className="bg-slate-50 p-6 rounded-3xl border border-slate-100">
+                  <div className="text-[10px] font-black text-slate-400 uppercase mb-1">Area</div>
+                  <div className="font-black text-slate-900 flex items-center gap-2 text-xl"><Ruler className="w-5 h-5 text-blue-600" /> {selectedListing.area_sqft} SQFT</div>
                 </div>
               </div>
 
-              {/* Description */}
-              <div>
-                <div className="text-[10px] text-slate-400 uppercase font-black mb-3">WhatsApp Message Extract</div>
-                <div className="text-slate-700 whitespace-pre-wrap leading-relaxed bg-slate-50 p-6 rounded-2xl border border-slate-100 text-sm italic">
-                  "{selectedListing.description}"
-                </div>
+              <div className="bg-slate-50 p-8 rounded-[32px] border border-slate-100">
+                <div className="text-[10px] font-black text-slate-400 uppercase mb-4 tracking-widest">WhatsApp Intelligence</div>
+                <p className="text-slate-700 leading-relaxed font-medium italic text-lg">"{selectedListing.description}"</p>
               </div>
 
-              {/* Source Info */}
-              <div className="flex items-center justify-between p-4 bg-blue-50/50 rounded-xl border border-blue-100/50">
-                <div className="text-xs text-blue-600 font-bold uppercase">
-                  Source: {selectedListing.group_name}
-                </div>
-                <div className="text-[10px] text-slate-400 font-bold">
-                  Extracted with {(selectedListing.extraction_confidence || 0) * 100}% confidence
-                </div>
+              <div className="flex gap-4">
+                <a href={`tel:${selectedListing.agent_phone}`} className="flex-1 bg-slate-900 text-white py-5 rounded-3xl font-black uppercase text-sm tracking-widest text-center shadow-xl hover:bg-slate-800">Call Agent</a>
+                <a href={`https://wa.me/91${selectedListing.agent_phone}`} target="_blank" className="flex-1 bg-green-600 text-white py-5 rounded-3xl font-black uppercase text-sm tracking-widest text-center shadow-xl hover:bg-green-700">WhatsApp</a>
               </div>
-
-              {/* Actions */}
-              {selectedListing.agent_phone && (
-                <div className="pt-4 flex flex-col sm:flex-row gap-4">
-                  <a
-                    href={`tel:${selectedListing.agent_phone}`}
-                    className="flex-1 flex items-center justify-center gap-3 bg-slate-900 text-white py-4 rounded-xl font-bold hover:bg-slate-800 transition-all shadow-lg active:scale-95"
-                  >
-                    <Phone className="w-5 h-5" />
-                    Call Agent
-                  </a>
-                  <a
-                    href={`https://wa.me/91${selectedListing.agent_phone}`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex-1 flex items-center justify-center gap-3 bg-green-600 text-white py-4 rounded-xl font-bold hover:bg-green-700 transition-all shadow-lg active:scale-95"
-                  >
-                    <ExternalLink className="w-5 h-5" />
-                    WhatsApp
-                  </a>
-                </div>
-              )}
             </div>
           </div>
         </div>

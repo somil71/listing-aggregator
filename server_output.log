@@ -2,4 +2,4 @@
 > whatsapp-real-estate-scraper@1.0.0 start
 > node src/api/server.js
 
-Server running at http://localhost:3000
+Secure server running at http://localhost:3000
