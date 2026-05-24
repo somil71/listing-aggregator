@@ -8,6 +8,7 @@
     "init-db": "node src/db/init.js",
     "scrape": "node src/scraper/whatsapp-scraper.js",
     "parse": "node src/scraper/message-parser.js",
+    "migrate": "node src/db/migrate.js",
     "dev": "nodemon src/api/server.js"
   },
   "dependencies": {
