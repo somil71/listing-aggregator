@@ -17,27 +17,20 @@
     "cors": "latest",
     "dayjs": "latest",
     "dotenv": "latest",
-    "dotenv-safe": "^9.1.0",
     "express": "latest",
-    "express-rate-limit": "^8.5.2",
-    "helmet": "^8.2.0",
     "lodash": "latest",
     "morgan": "latest",
     "node-cron": "latest",
     "puppeteer": "latest",
     "qrcode-terminal": "latest",
     "sqlite3": "latest",
-    "swagger-jsdoc": "^6.3.0",
-    "swagger-ui-express": "^5.0.1",
     "uuid": "latest",
     "whatsapp-web.js": "latest",
     "winston": "latest"
   },
   "devDependencies": {
     "eslint": "latest",
-    "jest": "^30.4.2",
     "nodemon": "latest",
-    "prettier": "latest",
-    "supertest": "^7.2.2"
+    "prettier": "latest"
   }
 }
