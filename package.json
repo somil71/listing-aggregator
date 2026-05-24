@@ -1,0 +1,35 @@
+{
+  "name": "whatsapp-real-estate-scraper",
+  "version": "1.0.0",
+  "description": "WhatsApp Real Estate Group Scraper + Dashboard",
+  "main": "src/api/server.js",
+  "scripts": {
+    "start": "node src/api/server.js",
+    "init-db": "node src/db/init.js",
+    "scrape": "node src/scraper/whatsapp-scraper.js",
+    "parse": "node src/scraper/message-parser.js",
+    "dev": "nodemon src/api/server.js"
+  },
+  "dependencies": {
+    "axios": "latest",
+    "body-parser": "latest",
+    "cors": "latest",
+    "dayjs": "latest",
+    "dotenv": "latest",
+    "express": "latest",
+    "lodash": "latest",
+    "morgan": "latest",
+    "node-cron": "latest",
+    "puppeteer": "latest",
+    "qrcode-terminal": "latest",
+    "sqlite3": "latest",
+    "uuid": "latest",
+    "whatsapp-web.js": "latest",
+    "winston": "latest"
+  },
+  "devDependencies": {
+    "nodemon": "latest",
+    "eslint": "latest",
+    "prettier": "latest"
+  }
+}
