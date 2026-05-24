@@ -1,227 +1,134 @@
+const envConfig = require('../config/env');
 const express = require('express');
-const cors = require('cors');
 const path = require('path');
-const { v4: uuidv4 } = require('uuid');
-const { dbAll, dbGet, dbRun } = require('./db-helpers');
+
+const appConfig = require('../config/app');
+const logger = require('../config/logger');
+
+// Middleware
+const { httpLogger, errorLogger } = require('./middleware/logger');
+const { corsMiddleware, securityHeaders, apiLimiter, searchLimiter } = require('./middleware/securityHeaders');
+const { notFoundHandler, globalErrorHandler } = require('./middleware/errorHandler');
+
+// Routes
+const listingsRouter = require('./routes/listings');
+const agentsRouter = require('./routes/agents');
+const groupsRouter = require('./routes/groups');
+const searchRouter = require('./routes/search');
+const digestsRouter = require('./routes/digests');
+const healthRouter = require('./routes/health');
+
+// Swagger Docs
+const swaggerUi = require('swagger-ui-express');
+const swaggerSpecs = require('./docs/swaggerDef');
+
+// Database
+const { getConnection } = require('../db/connection');
 
 const app = express();
-const port = process.env.PORT || 3000;
 
-app.use(cors());
-app.use(express.json());
+// ==================== SETUP ====================
+app.set('trust proxy', 1);
 
-// GET /api/listings/today
-app.get('/api/listings/today', async (req, res) => {
+// ==================== MIDDLEWARE ====================
+app.use(httpLogger);
+app.use(securityHeaders);
+app.use(corsMiddleware);
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
+
+// ==================== ROUTES ====================
+
+// Docs
+app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpecs));
+
+// Health Check
+app.use('/health', healthRouter);
+
+// Function to mount routes to support both new and legacy prefixes
+const mountRoutes = (prefix) => {
+  app.use(`${prefix}/listings`, apiLimiter, listingsRouter);
+  app.use(`${prefix}/agents`, apiLimiter, agentsRouter);
+  app.use(`${prefix}/groups`, apiLimiter, groupsRouter);
+  app.use(`${prefix}/search`, searchLimiter, searchRouter);
+  app.use(`${prefix}/digests`, apiLimiter, digestsRouter);
+};
+
+// Mount canonical v1 API
+mountRoutes(appConfig.apiPrefix);
+
+// Mount legacy API (for backwards compatibility with existing frontend)
+mountRoutes(appConfig.legacyPrefix);
+
+// ==================== STATIC FRONTEND ====================
+const distPath = path.join(__dirname, '../../dashboard/dist');
+app.use(express.static(distPath));
+
+// SPA fallback
+app.get(/.*/, (req, res) => {
+  if (req.path.startsWith('/api') || req.path === '/health') {
+    return notFoundHandler(req, res);
+  }
+  res.sendFile(path.join(distPath, 'index.html'));
+});
+
+// ==================== ERROR HANDLING ====================
+app.use(notFoundHandler);
+app.use(globalErrorHandler);
+
+// ==================== STARTUP ====================
+const PORT = envConfig.port;
+const HOST = envConfig.host;
+
+async function startServer() {
   try {
-    const {
-      location,
-      min_price,
-      max_price,
-      property_type,
-      agent_phone,
-      furnished,
-      min_confidence = 0.5,
-      limit = 100,
-      offset = 0
-    } = req.query;
+    const db = getConnection();
+    await db.connect();
+    logger.info('Database initialized successfully');
 
-    let where = `DATE(created_at) = DATE('now')`;
-    let params = [];
-
-    if (location) {
-      where += ` AND location = ?`;
-      params.push(location);
-    }
-    if (min_price) {
-      where += ` AND price >= ?`;
-      params.push(parseInt(min_price));
-    }
-    if (max_price) {
-      where += ` AND price <= ?`;
-      params.push(parseInt(max_price));
-    }
-    if (property_type) {
-      where += ` AND property_type = ?`;
-      params.push(property_type);
-    }
-    if (agent_phone) {
-      where += ` AND agent_phone = ?`;
-      params.push(agent_phone);
-    }
-    if (furnished === 'true') {
-      where += ` AND furnished = 1`;
-    } else if (furnished === 'false') {
-      where += ` AND furnished = 0`;
-    }
-
-    where += ` AND (extraction_confidence >= ? OR extraction_confidence IS NULL)`;
-    params.push(parseFloat(min_confidence));
-
-    const countRows = await dbAll(`SELECT COUNT(*) as count FROM listings WHERE ${where}`, params);
-    const total = countRows[0].count;
-
-    const sql = `
-      SELECT * FROM listings
-      WHERE ${where}
-      ORDER BY created_at DESC
-      LIMIT ? OFFSET ?
-    `;
-    const finalParams = [...params, parseInt(limit), parseInt(offset)];
-    const listings = await dbAll(sql, finalParams);
-
-    // Calculate statistics
-    const stats = await dbAll(`
-      SELECT
-        AVG(price) as avg_price,
-        MIN(price) as min_price,
-        MAX(price) as max_price,
-        AVG(bedrooms) as avg_bedrooms,
-        AVG(area_sqft) as avg_area
-      FROM listings
-      WHERE ${where}
-    `, params);
-
-    res.json({
-      success: true,
-      data: {
-        listings,
-        pagination: {
-          total,
-          limit: parseInt(limit),
-          offset: parseInt(offset),
-          hasMore: parseInt(offset) + parseInt(limit) < total
-        },
-        statistics: stats[0] || {}
-      }
+    const server = app.listen(PORT, HOST, () => {
+      logger.info(`Server running on http://${HOST}:${PORT}`);
+      logger.info(`API v1 active at http://${HOST}:${PORT}${appConfig.apiPrefix}`);
+      logger.info(`Legacy API active at http://${HOST}:${PORT}${appConfig.legacyPrefix}`);
+      logger.info(`Healthcheck active at http://${HOST}:${PORT}/health`);
     });
-  } catch (error) {
-    console.error('Error fetching listings:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
 
-// GET /api/listings/:id
-app.get('/api/listings/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const listing = await dbGet(`
-      SELECT l.*, r.message_text as raw_message
-      FROM listings l
-      LEFT JOIN raw_messages r ON l.raw_message_id = r.id
-      WHERE l.id = ?
-    `, [id]);
+    const shutdown = async (signal) => {
+      logger.info(`${signal} received, shutting down gracefully...`);
+      server.close(async () => {
+        logger.info('Express server closed');
+        await db.close();
+        process.exit(0);
+      });
+      
+      // Fallback kill after 10s
+      setTimeout(() => {
+        logger.error('Could not close connections in time, forcefully shutting down');
+        process.exit(1);
+      }, 10000);
+    };
 
-    if (!listing) return res.status(404).json({ success: false, error: 'Listing not found' });
-    res.json({ success: true, data: listing });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
 
-// GET /api/agents
-app.get('/api/agents', async (req, res) => {
-  try {
-    const agents = await dbAll(`
-      SELECT
-        agent_phone,
-        agent_name,
-        COUNT(*) as listing_count,
-        MAX(created_at) as last_listing_date
-      FROM listings
-      WHERE agent_phone IS NOT NULL
-      GROUP BY agent_phone
-      ORDER BY listing_count DESC
-    `);
-    res.json({ success: true, data: agents });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// GET /api/groups
-app.get('/api/groups', async (req, res) => {
-  try {
-    const groups = await dbAll(`
-      SELECT
-        group_name,
-        COUNT(*) as listing_count,
-        MAX(created_at) as last_update
-      FROM listings
-      GROUP BY group_name
-      ORDER BY last_update DESC
-    `);
-    res.json({ success: true, data: groups });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// GET /api/search
-app.get('/api/search', async (req, res) => {
-  try {
-    const { q, limit = 50 } = req.query;
-    if (!q) return res.status(400).json({ success: false, error: 'Query required' });
-    const searchTerm = `%${q}%`;
-    const results = await dbAll(`
-      SELECT * FROM listings
-      WHERE location LIKE ? OR description LIKE ? OR group_name LIKE ?
-      ORDER BY created_at DESC
-      LIMIT ?
-    `, [searchTerm, searchTerm, searchTerm, parseInt(limit)]);
-    res.json({ success: true, data: results });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// GET /api/digests/:date
-app.get('/api/digests/:date', async (req, res) => {
-  try {
-    const { date } = req.params;
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ success: false, error: 'Invalid date format' });
-
-    const listings = await dbAll(`SELECT * FROM listings WHERE DATE(created_at) = ?`, [date]);
-    const topLocations = await dbAll(`SELECT location, COUNT(*) as count FROM listings WHERE DATE(created_at) = ? GROUP BY location ORDER BY count DESC LIMIT 5`, [date]);
-    const topAgents = await dbAll(`SELECT agent_phone, agent_name, COUNT(*) as count FROM listings WHERE DATE(created_at) = ? AND agent_phone IS NOT NULL GROUP BY agent_phone ORDER BY count DESC LIMIT 5`, [date]);
-
-    const previousDate = new Date(date);
-    previousDate.setDate(previousDate.getDate() - 1);
-    const prevDateStr = previousDate.toISOString().split('T')[0];
-    const prevCountRows = await dbAll(`SELECT COUNT(*) as count FROM listings WHERE DATE(created_at) = ?`, [prevDateStr]);
-
-    res.json({
-      success: true,
-      data: {
-        date,
-        listings: listings.slice(0, 100),
-        statistics: {
-          total_listings: listings.length,
-          new_from_previous: listings.length - (prevCountRows[0]?.count || 0),
-          avg_price: listings.reduce((sum, l) => sum + (l.price || 0), 0) / listings.length || 0
-        },
-        top_locations: topLocations,
-        top_agents: topAgents
-      }
+    process.on('unhandledRejection', (reason, promise) => {
+      logger.error('Unhandled Rejection', { promise, reason });
     });
+
+    process.on('uncaughtException', (error) => {
+      logger.error('Uncaught Exception', { error: error.message, stack: error.stack });
+      process.exit(1);
+    });
+
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    errorLogger(error, null, { context: 'Server Startup' });
+    process.exit(1);
   }
-});
+}
 
-// POST /api/listings/:id/note
-app.post('/api/listings/:id/note', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { note_text } = req.body;
-    const noteId = uuidv4();
-    await dbRun(`INSERT INTO listing_notes (id, listing_id, note_text) VALUES (?, ?, ?)`, [noteId, id, note_text]);
-    res.json({ success: true, data: { id: noteId, listing_id: id, note_text } });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
+if (require.main === module) {
+  startServer();
+}
 
-app.use(express.static(path.resolve(__dirname, '../../dashboard/dist')));
-app.get(/^(?!\/api).+/, (req, res) => res.sendFile(path.resolve(__dirname, '../../dashboard/dist/index.html')));
-
-app.listen(port, () => console.log(`Server running at http://localhost:${port}`));
+module.exports = app;
