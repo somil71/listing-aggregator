@@ -12,7 +12,7 @@
     "dev": "nodemon src/api/server.js"
   },
   "dependencies": {
-    "axios": "latest",
+    "axios": "^1.16.1",
     "body-parser": "latest",
     "cors": "latest",
     "dayjs": "latest",
@@ -29,8 +29,8 @@
     "winston": "latest"
   },
   "devDependencies": {
-    "nodemon": "latest",
     "eslint": "latest",
+    "nodemon": "latest",
     "prettier": "latest"
   }
 }
