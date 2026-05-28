@@ -1,0 +1,36 @@
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  external_labels:
+    project: 'property-digest'
+    env:     'production'
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+rule_files:
+  - 'alerts.yml'
+
+scrape_configs:
+  # Property Digest API (unauthenticated — internal scrape only)
+  - job_name: 'property-digest'
+    static_configs:
+      - targets: ['app:3000']
+    metrics_path: '/api/v1/metrics'
+
+  # Redis
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+  # Node Exporter (host OS metrics)
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  # Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

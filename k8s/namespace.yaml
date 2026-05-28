@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: property-digest
+  labels:
+    app.kubernetes.io/name: property-digest
+    app.kubernetes.io/managed-by: kubectl

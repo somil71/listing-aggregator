@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: property-digest-redis
+  namespace: property-digest
+  labels:
+    app: property-digest-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: property-digest-redis
+  template:
+    metadata:
+      labels:
+        app: property-digest-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          args:
+            - redis-server
+            - --appendonly yes           # persist queue jobs to disk
+            - --maxmemory 512mb
+            - --maxmemory-policy allkeys-lru
+          resources:
+            requests:
+              cpu:    "100m"
+              memory: "128Mi"
+            limits:
+              cpu:    "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+      volumes:
+        - name: redis-data
+          persistentVolumeClaim:
+            claimName: property-digest-redis-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: property-digest-redis
+  namespace: property-digest
+spec:
+  type: ClusterIP
+  selector:
+    app: property-digest-redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: property-digest-redis-data
+  namespace: property-digest
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 2Gi

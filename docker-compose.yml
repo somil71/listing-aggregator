@@ -1,0 +1,88 @@
+version: '3.9'
+
+services:
+  app:
+    build: .
+    container_name: property-digest
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      - NODE_ENV=${NODE_ENV:-production}
+      - PORT=3000
+      - DATABASE_URL=${DATABASE_URL}
+      - UPSTASH_REDIS_REST_URL=${UPSTASH_REDIS_REST_URL}
+      - UPSTASH_REDIS_REST_TOKEN=${UPSTASH_REDIS_REST_TOKEN}
+      - CLERK_PUBLISHABLE_KEY=${CLERK_PUBLISHABLE_KEY}
+      - CLERK_SECRET_KEY=${CLERK_SECRET_KEY}
+      - CLERK_JWT_KEY=${CLERK_JWT_KEY}
+      - LOG_LEVEL=${LOG_LEVEL:-warn}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+      - METRICS_TOKEN=${METRICS_TOKEN}
+    volumes:
+      # Persist database, WhatsApp sessions, media and logs outside the container
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./reports:/app/reports
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e",
+        "require('http').get('http://localhost:3000/health',(r)=>{process.exit(r.statusCode===200?0:1)})"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    # Chrome runs with --no-sandbox (see whatsapp-client.js) — SYS_ADMIN not required.
+    # seccomp:unconfined kept as a conservative fallback; can be tightened to a
+    # chrome-specific seccomp profile once the deployment is validated.
+    security_opt:
+      - seccomp:unconfined
+
+  worker:
+    build: .
+    container_name: property-digest-worker
+    command: ["node", "src/worker/parseWorker.js"]
+    environment:
+      - NODE_ENV=${NODE_ENV:-production}
+      - DATABASE_URL=${DATABASE_URL}
+      - UPSTASH_REDIS_REST_URL=${UPSTASH_REDIS_REST_URL}
+      - UPSTASH_REDIS_REST_TOKEN=${UPSTASH_REDIS_REST_TOKEN}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - GROQ_MODEL=${GROQ_MODEL:-llama-3.1-8b-instant}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
+      - LOG_LEVEL=${LOG_LEVEL:-warn}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: property-digest-redis
+    # No host port mapping — Redis is reachable only from the docker network.
+    # Other services connect via the service name "redis:6379".
+    expose:
+      - "6379"
+    volumes:
+      - redis-data:/data
+    command: >
+      sh -c 'redis-server
+      --requirepass "$$REDIS_PASSWORD"
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru'
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sh", "-c", "redis-cli -a \"$$REDIS_PASSWORD\" ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  redis-data:

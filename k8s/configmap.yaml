@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: property-digest-config
+  namespace: property-digest
+data:
+  NODE_ENV:                    "production"
+  PORT:                        "3000"
+  LOG_LEVEL:                   "warn"
+  REDIS_URL:                   "redis://property-digest-redis:6379"
+  GROQ_MODEL:                  "llama-3.1-8b-instant"
+  # Set to "true" when connecting to a self-managed Postgres with a known CA.
+  # Leave "false" for Neon managed service (their pooler CA is not in Node's bundle).
+  PG_SSL_REJECT_UNAUTHORIZED:  "false"
+  # Comma-separated list of additional allowed CORS origins (beyond localhost defaults)
+  CORS_ORIGINS:                ""

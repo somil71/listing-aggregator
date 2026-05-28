@@ -1,0 +1,93 @@
+groups:
+  - name: PropertyDigest
+    interval: 1m
+    rules:
+
+      # ── Availability ────────────────────────────────────────────────────────
+      - alert: ServiceDown
+        expr: up{job="property-digest"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Property Digest is unreachable"
+          description: "The /health endpoint has not responded for >1 minute."
+
+      - alert: HighErrorRate
+        expr: >
+          rate(pd_http_requests_total{status_code=~"5.."}[5m])
+          /
+          rate(pd_http_requests_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "HTTP error rate >5%"
+          description: "{{ $value | humanizePercentage }} of requests are returning 5xx."
+
+      # ── Performance ──────────────────────────────────────────────────────────
+      - alert: HighLatencyP99
+        expr: >
+          histogram_quantile(0.99,
+            rate(pd_http_request_duration_seconds_bucket[5m])
+          ) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p99 latency >2 s"
+          description: "p99 API latency is {{ $value | humanizeDuration }} (threshold: 2s)."
+
+      - alert: HighMemoryUsage
+        expr: >
+          pd_node_nodejs_heap_size_used_bytes
+          /
+          pd_node_nodejs_heap_size_total_bytes > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node.js heap >85%"
+          description: "Heap at {{ $value | humanizePercentage }}. OOM kill risk."
+
+      # ── Business ──────────────────────────────────────────────────────────────
+      - alert: WhatsAppConnectionsDown
+        expr: pd_whatsapp_clients_active == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "All WhatsApp connections lost"
+          description: "No active WhatsApp clients. New listings are not being ingested."
+
+      - alert: ParserAccuracyDegraded
+        expr: avg_over_time(pd_parser_confidence_avg[1h]) < 0.65
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Parser confidence below 65%"
+          description: "Average extraction confidence is {{ $value | humanizePercentage }}."
+
+      # ── Database ─────────────────────────────────────────────────────────────
+      - alert: DatabaseQuerySlow
+        expr: >
+          histogram_quantile(0.95,
+            rate(pd_db_query_duration_seconds_bucket[5m])
+          ) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DB p95 query time >1 s"
+          description: "Slow queries may indicate missing indexes or lock contention."
+
+      # ── Redis ─────────────────────────────────────────────────────────────────
+      - alert: RedisDown
+        expr: up{job="redis"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis is unreachable"
+          description: "Cache and queue will fall back to in-process mode."
