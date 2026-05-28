@@ -1,0 +1,40 @@
+# Gitleaks config — extends defaults with project-specific patterns
+[extend]
+useDefault = true
+
+[[rules]]
+id = "clerk-secret-key"
+description = "Clerk Secret Key"
+regex = '''sk_(test|live)_[A-Za-z0-9]{30,}'''
+tags = ["key", "clerk"]
+
+[[rules]]
+id = "groq-api-key"
+description = "Groq API Key"
+regex = '''gsk_[A-Za-z0-9]{40,}'''
+tags = ["key", "groq"]
+
+[[rules]]
+id = "gemini-api-key"
+description = "Google Gemini / AI Studio API key"
+regex = '''AIza[0-9A-Za-z_-]{35}'''
+tags = ["key", "gemini", "google"]
+
+[[rules]]
+id = "neon-database-url"
+description = "Neon Postgres URL"
+regex = '''postgres(ql)?://[A-Za-z0-9_-]+:[A-Za-z0-9_-]+@[A-Za-z0-9.-]+\.neon\.tech'''
+tags = ["key", "neon", "database"]
+
+[allowlist]
+description = "Test and template strings"
+files = [
+  '''\.env\.example$''',
+  '''\.env\.local\.example$''',
+  '''package-lock\.json$''',
+]
+regexes = [
+  '''REPLACE_ME''',
+  '''your-secret-here''',
+  '''changeme''',
+]

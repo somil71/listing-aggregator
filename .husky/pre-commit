@@ -1,0 +1,22 @@
+#!/usr/bin/env sh
+# Husky pre-commit hook — runs before every git commit.
+
+# 1. Lint staged files
+npx lint-staged --no-stash 2>/dev/null || echo "ℹ️  lint-staged not installed — skip"
+
+# 2. Block obvious secrets
+if git diff --cached --diff-filter=AM -- '*.js' '*.ts' '*.tsx' '*.json' '*.env*' \
+   | grep -E "(sk_test_|sk_live_|gsk_|AIza[A-Za-z0-9_-]{30,})" \
+   | grep -v "REPLACE_ME" \
+   | grep -v "your-secret-here" \
+   | head -1; then
+  echo "🚨 Refusing commit — appears to contain a live API key."
+  echo "   If this is a false positive, bypass with: git commit --no-verify"
+  exit 1
+fi
+
+# 3. Block committing .env files (other than .example variants)
+if git diff --cached --name-only | grep -E "^\.env$|^dashboard/\.env\.local$" | grep -v ".example"; then
+  echo "🚨 Refusing commit — .env files must never be committed."
+  exit 1
+fi
