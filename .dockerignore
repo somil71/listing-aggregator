@@ -1,0 +1,14 @@
+node_modules
+dashboard/node_modules
+dashboard/dist
+.git
+# Never bake secrets into the image — inject via runtime env or secret mount
+.env
+.env.*
+logs
+reports
+data/wwebjs-auth
+data/media
+*.log
+*.md
+tests

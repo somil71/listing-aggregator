@@ -1,7 +1,37 @@
 node_modules/
 .env
+.env.*
+!.env.example
+dashboard/.env.local
+dashboard/.env*.local
 data/
 public/uploads/
 .wwebjs_auth/
 .wwebjs_cache/
 dist/
+
+# Build artifacts
+dashboard/dist/
+screenshots-out/
+
+# Logs
+*.log
+logs/
+server.log
+server_output.log
+tmp-*.log
+tmp-audit*.log
+tmp-final.log
+tmp-sec-test.log
+tmp-test.log
+dashboard/server_output.log
+
+# Editor/OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Stray Windows temp paths accidentally committed
+C:tempfilters.json
