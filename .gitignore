@@ -30,6 +30,7 @@ dashboard/server_output.log
 .DS_Store
 .idea/
 .vscode/
+.claude/
 *.swp
 *~
 

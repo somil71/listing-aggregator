@@ -25,6 +25,24 @@ if (!ENABLED) {
   const { resourceFromAttributes } = require('@opentelemetry/resources');
   const { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } = require('@opentelemetry/semantic-conventions');
 
+  // Parse OTEL_EXPORTER_OTLP_HEADERS — Grafana Cloud and most OTLP backends
+  // require an Authorization header. Format: "key1=value1,key2=value2"
+  function parseOtelHeaders() {
+    const raw = process.env.OTEL_EXPORTER_OTLP_HEADERS;
+    if (!raw) return {};
+    const headers = {};
+    for (const pair of raw.split(',')) {
+      const idx = pair.indexOf('=');
+      if (idx < 0) continue;
+      const key = pair.slice(0, idx).trim();
+      // Header values can be URL-encoded (Grafana Cloud uses %20 in Basic auth)
+      const val = decodeURIComponent(pair.slice(idx + 1).trim());
+      if (key) headers[key] = val;
+    }
+    return headers;
+  }
+  const otlpHeaders = parseOtelHeaders();
+
   const sdk = new NodeSDK({
     resource: resourceFromAttributes({
       [ATTR_SERVICE_NAME]:    process.env.OTEL_SERVICE_NAME    || 'property-digest',
@@ -34,10 +52,12 @@ if (!ENABLED) {
     }),
     traceExporter: new OTLPTraceExporter({
       url: `${process.env.OTEL_EXPORTER_OTLP_ENDPOINT}/v1/traces`,
+      headers: otlpHeaders,
     }),
     metricReader: new PeriodicExportingMetricReader({
       exporter: new OTLPMetricExporter({
         url: `${process.env.OTEL_EXPORTER_OTLP_ENDPOINT}/v1/metrics`,
+        headers: otlpHeaders,
       }),
       exportIntervalMillis: 30_000,
     }),
