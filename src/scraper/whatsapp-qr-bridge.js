@@ -544,14 +544,17 @@ async function dispatchCmd(cmd) {
         // listChats({onlyGroups:true}) returns just the groups — far smaller and
         // it settles in seconds.
         const fetchGroupChats = async () => {
-          if (typeof activeClient.listChats === 'function') {
-            try { return (await withTimeout(activeClient.listChats({ onlyGroups: true }), 20_000)) || []; } catch (_) {}
-          }
-          if (typeof activeClient.getAllGroups === 'function') {
-            try { return (await withTimeout(activeClient.getAllGroups(false), 20_000)) || []; } catch (_) {}
-          }
+          // getAllChats() is the method that actually returns this account's
+          // chats on WA Web 2.x — listChats({onlyGroups:true}) came back EMPTY
+          // (deploy logs: "first fetch → 0 groups"), and chaining the other
+          // methods first just burned a 20s timeout each before reaching
+          // getAllChats anyway (the ~60s-per-iteration stall). Call it directly
+          // and filter for groups ourselves below.
           if (typeof activeClient.getAllChats === 'function') {
-            try { return (await withTimeout(activeClient.getAllChats(), 20_000)) || []; } catch (_) {}
+            try { return (await withTimeout(activeClient.getAllChats(), 25_000)) || []; } catch (_) {}
+          }
+          if (typeof activeClient.listChats === 'function') {
+            try { return (await withTimeout(activeClient.listChats(), 25_000)) || []; } catch (_) {}
           }
           return [];
         };
@@ -575,9 +578,9 @@ async function dispatchCmd(cmd) {
         const startedAt = Date.now();
         // MAX_MS must stay well under the server's 130s getGroups timeout so the
         // bridge always answers before the server gives up (which surfaced as 500).
-        const MAX_MS    = 75_000;
-        const STABLE_MS = 8_000;   // group count steady for 8 s → accept
-        const MIN_MS    = 5_000;   // always wait at least 5 s for hydration
+        const MAX_MS    = 90_000;
+        const STABLE_MS = 10_000;  // group count steady for 10 s → accept
+        const MIN_MS    = 8_000;   // always wait at least 8 s for hydration
         let attempts = 0;
         let lastCount = -1;
         let stableSince = 0;
@@ -607,7 +610,9 @@ async function dispatchCmd(cmd) {
             emit('groups', { groups: best, totalChats: best.length, attempts });
             return;
           }
-          await new Promise(r => setTimeout(r, 2000));
+          // Poll gently: getAllChats() over ~500 chats is heavy, and hammering
+          // it every 2s kept the puppeteer page busy enough to slow hydration.
+          await new Promise(r => setTimeout(r, 5000));
         }
         // Timed out — return the best set we saw rather than risk a final empty fetch
         emit('groups', { groups: best, totalChats: best.length, attempts, timedOut: true });

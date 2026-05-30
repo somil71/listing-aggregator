@@ -97,19 +97,24 @@ router.get('/status', authenticate, _withWhatsappBreaker(
 ));
 
 // ── List all groups from connected phone ───────────────────────────────────
-// Guard before the circuit breaker so a "not connected" user state never
-// counts as a breaker failure (which would trip the breaker after 5 opens).
-router.get('/groups', authenticate, async (req, res, next) => {
+// NOT wrapped in the circuit breaker: a slow/failed group scan is a per-request
+// concern, but the breaker is SHARED with /status and /initiate-qr. When /groups
+// failures tripped it, those routes started returning 503 too — so a single bad
+// scan locked the user out of reconnecting. Handle errors locally instead.
+router.get('/groups', authenticate, async (req, res) => {
   if (!whatsappService.isConnected(req.userId)) {
     return res.status(409).json({
       success: false,
       error: 'WhatsApp is not connected. Please scan the QR code first.',
     });
   }
-  return next();
-}, _withWhatsappBreaker(
-  async (req) => ({ groups: await whatsappService.getGroups(req.userId) })
-));
+  try {
+    const groups = await whatsappService.getGroups(req.userId);
+    res.json({ success: true, data: { groups } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: 'Could not load groups. Please try again.' });
+  }
+});
 
 // ── Save selected groups ───────────────────────────────────────────────────
 router.post('/select-groups', authenticate, async (req, res) => {
