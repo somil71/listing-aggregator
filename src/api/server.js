@@ -842,6 +842,37 @@ app.get('/api/listings/:id', authenticate, auditLog('view_listing', 'listing'), 
   }
 });
 
+// ── User "report wrong" flag ──────────────────────────────────────────────────
+// The human detection channel: when our deterministic validators miss a bad
+// extraction, the user tells us. We (a) count it so health.js shows the flag
+// rate — i.e. how much auto-heal is missing — and (b) immediately quarantine
+// the owner's own row so the bad data stops being shown while we add a rule.
+// Scoped to the listing's owner (it's their data), so a flag can't be abused.
+app.post('/api/listings/:id/flag', authenticate, auditLog('flag_listing', 'listing'), async (req, res) => {
+  try {
+    const userRow = await pg.dbGet('SELECT id FROM users WHERE clerk_user_id = $1', [req.userId]).catch(() => null);
+    if (!userRow) return res.status(404).json({ success: false, error: 'Listing not found' });
+
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.slice(0, 80) : '';
+    const updated = await pg.dbGet(
+      `UPDATE listings
+          SET user_flags        = user_flags + 1,
+              last_flagged_at   = NOW(),
+              quarantine_reason = 'user_flagged' || CASE WHEN $3 <> '' THEN ':' || $3 ELSE '' END,
+              confidence        = 0,
+              updated_at        = NOW()
+        WHERE id = $1 AND user_id = $2
+        RETURNING user_flags`,
+      [req.params.id, userRow.id, reason]
+    );
+    if (!updated) return res.status(404).json({ success: false, error: 'Listing not found' });
+    res.json({ success: true, data: { user_flags: updated.user_flags, hidden: true } });
+  } catch (error) {
+    logger.error('POST /api/listings/:id/flag failed', { error: error.message });
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
 // ── AI-generated property summary ─────────────────────────────────────────────
 // Calls Groq with the raw message + extracted fields to produce a professional
 // 2-3 sentence description. Results are cached via cacheService (TTL-backed,

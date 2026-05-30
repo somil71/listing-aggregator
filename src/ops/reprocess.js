@@ -82,6 +82,7 @@ async function runNormalize(a) {
     `SELECT l.id, l.price, l.currency, l.furnished, l.amenities,
             l.area_text, l.community, l.group_name,
             l.bedrooms, l.area_sqft, l.agent_phone, l.agent_name, l.confidence,
+            l.intent, l.rent_period, l.quarantine_reason,
             r.text AS raw_text,
             mg.group_name AS mg_group_name
        FROM listings l
@@ -94,7 +95,7 @@ async function runNormalize(a) {
   );
 
   let scanned = 0, updated = 0;
-  const tally = { price: 0, furnished: 0, amenities: 0, location: 0, group_name: 0, confidence: 0 };
+  const tally = { price: 0, furnished: 0, amenities: 0, location: 0, group_name: 0, confidence: 0, quarantine_reason: 0 };
 
   for (const row of rows) {
     scanned++;
@@ -115,6 +116,11 @@ async function runNormalize(a) {
       agent_name: row.agent_name,
       parking: regexParser.hasParking(text),
       confidence: row.confidence != null ? Number(row.confidence) : null,
+      // intent + rent_period drive the rent-ceiling sanity check in normalize()
+      // — without them an existing bad rent row couldn't be re-quarantined here.
+      intent: row.intent,
+      rent_period: row.rent_period,
+      quarantine_reason: row.quarantine_reason,
     };
     regexParser.normalize(parsed, text);
 
@@ -131,6 +137,7 @@ async function runNormalize(a) {
       location: changed(row.community, parsed.community) || changed(row.area_text, parsed.area_text),
       group_name: changed(row.group_name, groupName),
       confidence: changed(row.confidence, parsed.confidence),
+      quarantine_reason: changed(row.quarantine_reason, parsed.quarantine_reason),
     };
     const anyChange = Object.values(diffs).some(Boolean);
     if (!anyChange) continue;
@@ -142,7 +149,7 @@ async function runNormalize(a) {
       `UPDATE listings
           SET price = $2, currency = $3, furnished = $4, amenities = $5,
               area_text = $6, community = $7, group_name = $8,
-              confidence = $9, updated_at = NOW()
+              confidence = $9, quarantine_reason = $10, updated_at = NOW()
         WHERE id = $1`,
       [row.id,
        parsed.price ?? null,
@@ -152,7 +159,8 @@ async function runNormalize(a) {
        parsed.area_text || null,
        parsed.community || null,
        groupName || null,
-       parsed.confidence ?? 0]
+       parsed.confidence ?? 0,
+       parsed.quarantine_reason ?? null]
     );
   }
 

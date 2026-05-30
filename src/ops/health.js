@@ -68,6 +68,25 @@ function userFilter(user, alias) {
   if (total > 10 && pct(cov.has_price) < COVERAGE_WARN) warnings.push(`price coverage ${f1(pct(cov.has_price))} below ${f1(COVERAGE_WARN)}`);
   if (total > 10 && pct(cov.has_loc)   < COVERAGE_WARN) warnings.push(`location coverage ${f1(pct(cov.has_loc))} below ${f1(COVERAGE_WARN)}`);
 
+  // 4. Auto-heal signals. Two detection channels:
+  //    - quarantined: rows the deterministic sanity validator caught and hid
+  //      (the system working). A *spike* in the rate means the parser regressed.
+  //    - user-flagged: the human channel — a flagged row is one our validators
+  //      MISSED, so it always warrants a look (and a new validator rule).
+  const q = await pg.dbGet(
+    `SELECT COUNT(*) FILTER (WHERE quarantine_reason IS NOT NULL) quarantined,
+            COUNT(*) FILTER (WHERE user_flags > 0) flagged_rows,
+            COALESCE(SUM(user_flags), 0) flag_total
+       FROM listings l ${fl.sql}`, fl.params);
+  const reasons = await pg.dbAll(
+    `SELECT split_part(quarantine_reason, ':', 1) reason, COUNT(*) n
+       FROM listings l ${fl.sql ? fl.sql + ' AND' : 'WHERE'} quarantine_reason IS NOT NULL
+      GROUP BY 1 ORDER BY n DESC LIMIT 5`, fl.params);
+  const reasonStr = reasons.length ? reasons.map(r => `${r.reason}×${r.n}`).join(', ') : 'none';
+  console.log(`autoheal  : quarantined ${q.quarantined} (${reasonStr}) | user-flagged ${q.flagged_rows} row(s) / ${q.flag_total} flags`);
+  if (total > 10 && pct(q.quarantined) > 0.2) warnings.push(`quarantine rate ${f1(pct(q.quarantined))} high — parser regression?`);
+  if (Number(q.flagged_rows) > 0) warnings.push(`${q.flagged_rows} user-flagged listing(s) — auto-heal missed these; add a sanity rule`);
+
   console.log('');
   if (warnings.length) {
     console.log(`STATUS: WARN (${warnings.length})`);

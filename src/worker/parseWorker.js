@@ -93,9 +93,11 @@ async function processOne(job) {
         price, currency, rent_period,
         area_text, community,
         agent_name, agent_phone,
-        confidence, extracted_by, raw_llm_json, description, ts_listed)
+        confidence, extracted_by, raw_llm_json, description, ts_listed,
+        quarantine_reason)
      VALUES ($1,$2,$3,$4, $5,$6,$7,$8,$9, $10,$11,$12,$13,$14,
-             $15,$16,$17, $18,$19, $20,$21, $22,$23,$24,$25,$26)
+             $15,$16,$17, $18,$19, $20,$21, $22,$23,$24,$25,$26,
+             $27)
      ON CONFLICT (raw_message_id) DO UPDATE SET
        wa_group_id   = EXCLUDED.wa_group_id,
        group_name    = EXCLUDED.group_name,
@@ -120,6 +122,7 @@ async function processOne(job) {
        extracted_by  = EXCLUDED.extracted_by,
        raw_llm_json  = EXCLUDED.raw_llm_json,
        description   = EXCLUDED.description,
+       quarantine_reason = EXCLUDED.quarantine_reason,
        updated_at    = NOW()`,
     [
       raw.user_id, job.raw_id, raw.wa_group_id, raw.group_name || job.group_name,
@@ -145,6 +148,7 @@ async function processOne(job) {
       parsed.raw_llm_json ? JSON.stringify(parsed.raw_llm_json) : null,
       parsed.description || null,
       raw.ts_received,
+      parsed.quarantine_reason ?? null,
     ]
   );
 

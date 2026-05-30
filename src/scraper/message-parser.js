@@ -580,6 +580,55 @@ class MessageParser {
       parsed.confidence = recomputed;
     }
 
+    // Final deterministic guardrail. Runs LAST so it can override the raise-only
+    // rule above: a confident-but-impossible extraction (the class the LLM is
+    // *sure* about, which the confidence gate can't catch) is quarantined here.
+    this._sanityCheck(parsed, text);
+
+    return parsed;
+  }
+
+  // Plausibility guardrail — the automated catch for confident hallucinations.
+  // Sets parsed.quarantine_reason and forces confidence to 0 when a value is
+  // impossible for a real listing, so the dashboard min_confidence gate hides
+  // it with no human in the loop. NULL reason = clean. Deliberately conservative
+  // (a wrong price shown to a user is worse than a rare real outlier hidden);
+  // bands are tunable below. Idempotent: re-running over raw_messages re-derives
+  // and re-quarantines, so improving this heals every existing row in one pass.
+  _sanityCheck(parsed, text) {
+    // A user-reported quarantine is a human verdict — never clear it from a
+    // regex re-derive. Keep it hidden (conf 0) and stop. Only a person can lift
+    // a 'user_flagged' quarantine.
+    if (parsed.quarantine_reason && /^user_flagged/.test(parsed.quarantine_reason)) {
+      parsed.confidence = 0;
+      return parsed;
+    }
+    parsed.quarantine_reason = null;  // default clean; overwritten below on failure
+    const price = parsed.price != null ? Number(parsed.price) : null;
+    if (price == null || isNaN(price)) return parsed;
+
+    // Floor: no real rent or sale is <= a few units of any currency. Catches the
+    // "7 INR" class of misparse.
+    if (price > 0 && price <= MessageParser.PRICE_FLOOR) {
+      return this._quarantine(parsed, `implausible_price_low:${price}`);
+    }
+    // Rent ceiling: a recurring rent above the band is almost always a misparse
+    // (e.g. "4500k chalo" → 4,500,000). Sales legitimately reach crores, so the
+    // ceiling is applied to rent only.
+    const isRent = parsed.intent === 'rent' || !!parsed.rent_period;
+    if (isRent) {
+      const cur = (parsed.currency || 'INR').toUpperCase();
+      const ceiling = MessageParser.RENT_CEILING[cur] ?? MessageParser.RENT_CEILING.DEFAULT;
+      if (price > ceiling) {
+        return this._quarantine(parsed, `implausible_rent_high:${price}${cur}`);
+      }
+    }
+    return parsed;
+  }
+
+  _quarantine(parsed, reason) {
+    parsed.quarantine_reason = reason;
+    parsed.confidence = 0;   // below the dashboard min_confidence gate → auto-hidden
     return parsed;
   }
 
@@ -621,6 +670,12 @@ class MessageParser {
     return parsed;
   }
 }
+
+// Sanity bands for _sanityCheck — tune as the data teaches us. Floor catches
+// absurd-low misparses ("7 INR"); rent ceilings catch the thousands-suffix
+// expansion ("4500k" → 4.5M). Sales are intentionally uncapped.
+MessageParser.PRICE_FLOOR  = 100;
+MessageParser.RENT_CEILING = { INR: 2000000, AED: 2000000, USD: 100000, DEFAULT: 2000000 };
 
 const parserInstance = new MessageParser();
 
