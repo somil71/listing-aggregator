@@ -1,5 +1,5 @@
 import {ClerkProvider} from '@clerk/react';
-import React from 'react'
+import React from 'react' // v2026-05-30
 import ReactDOM from 'react-dom/client'
 import App from './App'
 import './index.css'
