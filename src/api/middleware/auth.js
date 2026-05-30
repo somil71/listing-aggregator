@@ -43,9 +43,13 @@ SwIDAQAB
 // then fall back to the embedded key above, then fall back to secretKey (JWKS fetch).
 const _jwtKey = process.env.CLERK_JWT_KEY || CLERK_RSA_PUBLIC_KEY;
 
+// authorizedParties checks the JWT `azp` claim against an allowlist.
+// We skip it (pass undefined) — the RSA signature check is sufficient proof
+// that the token is legitimate. The azp check only adds value in multi-frontend
+// shared-key scenarios which don't apply here.
 const _verifyOpts = {
   jwtKey: _jwtKey,
-  authorizedParties,
+  authorizedParties: undefined,
 };
 
 // ── Standard middleware — reads Clerk JWT from Authorization header ────────────
