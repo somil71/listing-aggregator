@@ -73,11 +73,15 @@ jobs:
       - run: npm ci
       - run: cd dashboard && npm ci && npm run build
       - name: Verify backend boots
+        # Hit /live, not /health: /live is a pure liveness probe (no deps),
+        # whereas /health does a real `SELECT 1` and returns 503 without a DB.
+        # With the stub DATABASE_URL below, /health would always 503 and fail
+        # this smoke; /live proves the process boots and serves HTTP.
         run: |
           node -e "require('./src/api/server.js');" &
           PID=$!
           sleep 5
-          curl -fsS http://localhost:3000/health
+          curl -fsS http://localhost:3000/live
           kill $PID
         env:
           DATABASE_URL: postgresql://stub
