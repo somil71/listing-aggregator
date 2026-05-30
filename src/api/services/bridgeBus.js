@@ -126,6 +126,10 @@ async function replayRecent(userId, sinceMs = 5_000) {
 
 // ── Sending commands to a bridge (server → bridge subprocess) ──────────────
 async function sendCommand(userId, cmd) {
+  // Stamp a wall-clock ts so the bridge can ignore commands that predate
+  // its own boot (defeats the disconnect/initiate-qr race where a stale
+  // 'disconnect' queued before the old bridge died kills the new one).
+  if (cmd && cmd.ts == null) cmd = { ...cmd, ts: Date.now() };
   const body = JSON.stringify(cmd);
   const sig  = sign(body);
   const envelope = JSON.stringify({ body, sig });
@@ -141,6 +145,15 @@ async function sendCommand(userId, cmd) {
   }
   _localBus.emit(`cmd:${userId}`, cmd);
   return false;
+}
+
+// ── Drain any queued commands for a user (called before spawning a bridge) ──
+// Belt-and-suspenders against the disconnect/initiate race: clears stale
+// commands so a freshly-spawned bridge starts with an empty queue.
+async function clearCommands(userId) {
+  if (cacheService?._redisReady) {
+    try { await cacheService._redis.del(`bridge:cmd:${userId}`); } catch (_) {}
+  }
 }
 
 // ── Bridge-side command receive loop ────────────────────────────────────────
@@ -191,6 +204,7 @@ module.exports = {
   subscribeEvents,
   replayRecent,
   sendCommand,
+  clearCommands,
   receiveCommands,
   // Exported for the bridge subprocess to know the agreed secret
   HMAC_SECRET,
