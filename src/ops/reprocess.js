@@ -177,7 +177,7 @@ async function runFull(a) {
        FROM raw_messages r
        LEFT JOIN monitored_groups mg
          ON mg.user_id = r.user_id AND mg.wa_group_id = r.wa_group_id
-       ${sql.replace(/l\.ts_listed/g, 'r.ts_received')}
+       ${sql.replace(/r\.ts_listed/g, 'r.ts_received')}
        ORDER BY r.ts_received DESC${limit}`,
     params
   );

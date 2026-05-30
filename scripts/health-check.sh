@@ -26,6 +26,15 @@ set -uo pipefail   # NOTE: no -e — we WANT to capture health.js's non-zero exi
 
 cd "$(dirname "$0")/.." || exit 2
 
+# The webhook lives in .env (loaded by node, NOT by this shell). A bare cron
+# line won't have it in the environment, so pull it from .env when it isn't
+# already exported. This is what makes `cd /app && bash scripts/health-check.sh`
+# work unattended without a wrapper that sources .env first.
+if [[ -z "${HEALTH_ALERT_WEBHOOK:-}" && -f .env ]]; then
+  _hw="$(grep -E '^HEALTH_ALERT_WEBHOOK=' .env | tail -1 | cut -d= -f2-)"
+  [[ -n "$_hw" ]] && export HEALTH_ALERT_WEBHOOK="$_hw"
+fi
+
 LABEL="${HEALTH_ALERT_LABEL:-listings}"
 LOG_DIR="logs"
 LOG_FILE="${LOG_DIR}/health-$(date +%Y%m%d).log"
