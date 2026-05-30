@@ -2,6 +2,7 @@ node_modules/
 .env
 .env.*
 !.env.example
+!dashboard/.env
 dashboard/.env.local
 dashboard/.env*.local
 data/
