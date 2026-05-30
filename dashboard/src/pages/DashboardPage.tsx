@@ -454,7 +454,16 @@ export default function DashboardPage() {
       const headers = await authHeaders();
       const res = await axios.get('/api/listings/filters', { headers });
       if (res.data.success && res.data.data) {
-        setFilterOptions(res.data.data);
+        const d = res.data.data;
+        setFilterOptions({
+          locations:      Array.isArray(d.locations)      ? d.locations      : [],
+          configurations: Array.isArray(d.configurations) ? d.configurations : [],
+          price_ranges:   Array.isArray(d.price_ranges)   ? d.price_ranges   : [],
+          intents:        Array.isArray(d.intents)        ? d.intents        : [],
+          property_types: Array.isArray(d.property_types) ? d.property_types : [],
+          furnished:      Array.isArray(d.furnished)      ? d.furnished      : [],
+          rent_periods:   Array.isArray(d.rent_periods)   ? d.rent_periods   : [],
+        });
       }
     } catch (err) {
       console.error('fetchFilterOptions failed', err);

@@ -707,7 +707,10 @@ app.get('/api/listings/filters', authenticate, async (req, res) => {
     ).catch(() => null);
 
     if (!userRow) {
-      return res.json({ success: true, data: {} });
+      return res.json({
+        success: true,
+        data: { locations: [], configurations: [], price_ranges: [], intents: [], property_types: [], furnished: [], rent_periods: [] },
+      });
     }
 
     const pgUserId = userRow.id;
