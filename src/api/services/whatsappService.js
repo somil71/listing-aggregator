@@ -413,6 +413,15 @@ class WhatsAppService {
          VALUES (COALESCE((SELECT id FROM whatsapp_sessions WHERE user_id=?),?),?,'ready',?,CURRENT_TIMESTAMP)`,
         [userId, uuidv4(), userId, data.phone]
       );
+      // Pre-warm the group scan so it completes in the background before the
+      // user opens the select-groups modal. wppconnect's chat DB needs ~10s to
+      // begin hydrating after ready, so we defer the initial scan by 8s.
+      // The scan result is cached; the modal's getGroups() call returns instantly.
+      setTimeout(() => {
+        if (!this.clients.get(userId)?.ready) return; // disconnected in the meantime
+        this.getGroups(userId).catch(() => {}); // best-effort; errors are non-fatal
+      }, 8000);
+
       // Resumed session → recover anything missed during downtime. Wait ~10s
       // first so WhatsApp Web has begun streaming the backlog from the phone;
       // backfillGroup then waits for the per-chat sync to settle before
@@ -538,13 +547,14 @@ class WhatsAppService {
     const promise = new Promise((res, rej) => {
       resolve = res;
       reject  = rej;
-      // Match the bridge's polling window (90s) + a small grace buffer
+      // Bridge polls for up to 120s (MAX_MS in the bridge) — give it 130s
+      // before we give up so the bridge always gets a chance to resolve first.
       setTimeout(() => {
         if (this._groupsByUser.get(userId)?.promise === promise) {
           this._groupsByUser.delete(userId);
         }
         rej(new Error('Group fetch timed out'));
-      }, 95000);
+      }, 130_000);
     });
 
     this._groupsByUser.set(userId, { promise, resolve, reject });
