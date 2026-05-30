@@ -13,7 +13,13 @@ const authenticate = async (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ success: false, error: 'Unauthorized' });
   try {
-    const { payload } = await jwtVerify(token, JWKS);
+    // Clock-skew tolerance: Clerk dev tokens live only ~60s, and small clock
+    // drift between this container and Clerk's issuer was rejecting tokens that
+    // were valid per Clerk but appeared a hair past `exp` here ("exp claim
+    // timestamp check failed"). 60s absorbs realistic container skew + the
+    // refresh boundary. Clerk's own backend SDK applies a tolerance for the
+    // same reason.
+    const { payload } = await jwtVerify(token, JWKS, { clockTolerance: 60 });
     req.userId = payload.sub;
     next();
   } catch (err) {
