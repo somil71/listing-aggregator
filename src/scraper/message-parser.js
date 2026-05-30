@@ -596,13 +596,22 @@ class MessageParser {
   // bands are tunable below. Idempotent: re-running over raw_messages re-derives
   // and re-quarantines, so improving this heals every existing row in one pass.
   _sanityCheck(parsed, text) {
-    // A user-reported quarantine is a human verdict — never clear it from a
-    // regex re-derive. Keep it hidden (conf 0) and stop. Only a person can lift
-    // a 'user_flagged' quarantine.
-    if (parsed.quarantine_reason && /^user_flagged/.test(parsed.quarantine_reason)) {
-      parsed.confidence = 0;
-      return parsed;
+    const prior = parsed.quarantine_reason;
+    // Verdict-style quarantines come from the LLM (not_a_listing) or a human
+    // (user_flagged). A free regex re-derive must never overturn them — only the
+    // LLM (--full) or a person can lift them. This function OWNS only the
+    // deterministic 'implausible_*' reasons.
+    const isVerdict = prior && /^(user_flagged|not_a_listing)/.test(prior);
+
+    // The LLM judged this isn't a property at all (vehicle/job/service/chat).
+    // Honor it: quarantine so the raise-only confidence recompute can't un-hide a
+    // non-listing whose stray number (a salary, a resale price) looks plausible.
+    // This is the class the price-band checks below CAN'T catch.
+    if (parsed.is_listing === false) {
+      return this._quarantine(parsed, 'not_a_listing');
     }
+    if (isVerdict) { parsed.confidence = 0; return parsed; }
+
     parsed.quarantine_reason = null;  // default clean; overwritten below on failure
     const price = parsed.price != null ? Number(parsed.price) : null;
     if (price == null || isNaN(price)) return parsed;

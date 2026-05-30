@@ -22,6 +22,9 @@ const { PARSE_QUEUE } = require('../db/dualWrite');
 const STALE_INGEST_MIN = 120;   // newest raw_message older than this ⇒ warn
 const BACKLOG_WARN      = 100;   // queued parse jobs above this ⇒ warn
 const COVERAGE_WARN     = 0.5;   // <50% of listings with price/location ⇒ warn
+const NEW_CLASS_WARN    = 5;     // ≥N quarantines of ONE reason in 24h ⇒ new hallucination class
+const NEW_CLASS_WINDOW_H = 24;   // lookback window for the new-class check
+const FLAG_RATE_WARN    = 0.03;  // user-flag rate above this ⇒ auto-heal missing too much
 
 function userFilter(user, alias) {
   return user ? { sql: `WHERE ${alias}.user_id = $1`, params: [user] } : { sql: '', params: [] };
@@ -81,11 +84,57 @@ function userFilter(user, alias) {
   const reasons = await pg.dbAll(
     `SELECT split_part(quarantine_reason, ':', 1) reason, COUNT(*) n
        FROM listings l ${fl.sql ? fl.sql + ' AND' : 'WHERE'} quarantine_reason IS NOT NULL
-      GROUP BY 1 ORDER BY n DESC LIMIT 5`, fl.params);
+      GROUP BY 1 ORDER BY n DESC LIMIT 8`, fl.params);
   const reasonStr = reasons.length ? reasons.map(r => `${r.reason}×${r.n}`).join(', ') : 'none';
-  console.log(`autoheal  : quarantined ${q.quarantined} (${reasonStr}) | user-flagged ${q.flagged_rows} row(s) / ${q.flag_total} flags`);
+  const flagRate = total ? Number(q.flagged_rows) / total : 0;
+  console.log(`autoheal  : quarantined ${q.quarantined} (${reasonStr})`);
+  console.log(`flags     : ${q.flagged_rows} flagged row(s) / ${q.flag_total} flags | flag rate ${(flagRate * 100).toFixed(1)}% (warn >${f1(FLAG_RATE_WARN)})`);
   if (total > 10 && pct(q.quarantined) > 0.2) warnings.push(`quarantine rate ${f1(pct(q.quarantined))} high — parser regression?`);
-  if (Number(q.flagged_rows) > 0) warnings.push(`${q.flagged_rows} user-flagged listing(s) — auto-heal missed these; add a sanity rule`);
+
+  // New-hallucination-class detection: a single quarantine reason spiking in the
+  // last 24h means a NEW pattern the LLM keeps making (e.g. job ads parsed as
+  // listings). updated_at ≈ when the row was (re)quarantined. Cron picks up the
+  // WARN automatically — no log-reading required.
+  const recentClasses = await pg.dbAll(
+    `SELECT split_part(quarantine_reason, ':', 1) reason, COUNT(*) n
+       FROM listings l
+      ${fl.sql ? fl.sql + ' AND' : 'WHERE'} quarantine_reason IS NOT NULL
+        AND quarantine_reason NOT LIKE 'user_flagged%'
+        AND updated_at >= NOW() - INTERVAL '${NEW_CLASS_WINDOW_H} hours'
+      GROUP BY 1 HAVING COUNT(*) >= ${NEW_CLASS_WARN}
+      ORDER BY n DESC`, fl.params);
+  for (const c of recentClasses) {
+    warnings.push(`new pattern: ${c.n}× '${c.reason}' in ${NEW_CLASS_WINDOW_H}h — recurring class, codify a rule / fix the prompt`);
+  }
+
+  // Flag-rate threshold (the human channel telling us auto-heal misses too much).
+  if (total > 10 && flagRate > FLAG_RATE_WARN) {
+    warnings.push(`user-flag rate ${(flagRate * 100).toFixed(1)}% > ${f1(FLAG_RATE_WARN)} — add validator rules for what users keep flagging`);
+  } else if (Number(q.flagged_rows) > 0) {
+    warnings.push(`${q.flagged_rows} user-flagged listing(s) — auto-heal missed these; add a sanity rule`);
+  }
+
+  // Daily snapshot (global runs only) so the flag/quarantine rate is trackable
+  // over time, not just "right now". UPSERT by date → re-running today overwrites.
+  if (!user) {
+    const prev = await pg.dbGet(
+      `SELECT date, flag_rate FROM quality_snapshots WHERE date < CURRENT_DATE ORDER BY date DESC LIMIT 1`);
+    await pg.query(
+      `INSERT INTO quality_snapshots
+         (date, total, quarantined, user_flagged_rows, flag_total, flag_rate, quarantine_rate, updated_at)
+       VALUES (CURRENT_DATE, $1, $2, $3, $4, $5, $6, NOW())
+       ON CONFLICT (date) DO UPDATE SET
+         total = EXCLUDED.total, quarantined = EXCLUDED.quarantined,
+         user_flagged_rows = EXCLUDED.user_flagged_rows, flag_total = EXCLUDED.flag_total,
+         flag_rate = EXCLUDED.flag_rate, quarantine_rate = EXCLUDED.quarantine_rate,
+         updated_at = NOW()`,
+      [total, Number(q.quarantined), Number(q.flagged_rows), Number(q.flag_total),
+       flagRate.toFixed(4), (total ? Number(q.quarantined) / total : 0).toFixed(4)]);
+    if (prev && prev.flag_rate != null) {
+      const delta = (flagRate - Number(prev.flag_rate)) * 100;
+      console.log(`trend     : flag rate ${delta >= 0 ? '+' : ''}${delta.toFixed(1)} pts vs ${new Date(prev.date).toISOString().slice(0, 10)} (${(Number(prev.flag_rate) * 100).toFixed(1)}%)`);
+    }
+  }
 
   console.log('');
   if (warnings.length) {
