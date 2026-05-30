@@ -255,9 +255,16 @@ class MessageParser {
     m = text.match(/\b(\d+(?:\.\d+)?)\s*(Cr|Crore|Lakh|Lac)\b/i);
     if (m) { this._lastCurrency = 'INR'; return this._scaleAmount(parseFloat(m[1]), m[2]); }
 
-    // bare price with rent context
-    m = text.match(/(?:rent|price|monthly|per\s*month|pm|p\/m)\s*(?:is|:|=)?\s*(?:₹|Rs\.?|INR|AED)?\s*(\d+(?:,\d+)*)/i);
-    if (m) return parseFloat(m[1].replace(/,/g, ''));
+    // bare price with rent context. Allow ANY separator between the keyword and
+    // the number — colon, equals, and crucially a dash/hyphen, since WhatsApp
+    // listings overwhelmingly write "Rent-22500" / "Rent–14500". The previous
+    // pattern only allowed whitespace/colon/equals, so every hyphenated rent
+    // was silently dropped (LLM-only, no fallback) → price NULL on the dashboard.
+    m = text.match(/(?:rent|price|monthly|per\s*month|pm|p\/m|cost|budget)\b[\s:=._\-–—]*(?:₹|Rs\.?|INR|AED)?\s*(\d+(?:,\d+)*(?:\.\d+)?)\s*(k|K|L|Lakh|Lac|Cr|Crore)?/i);
+    if (m) {
+      if (/\b\d*\s*(?:BHK|RK|BK)\b/i.test(text)) this._lastCurrency = this._lastCurrency || 'INR';
+      return this._scaleAmount(parseFloat(m[1].replace(/,/g, '')), m[2]);
+    }
 
     m = text.match(/(\d+(?:,\d+)*)\s*(?:per\s*month|pm|p\/m|\/month|monthly|month)/i);
     if (m) return parseFloat(m[1].replace(/,/g, ''));
@@ -383,6 +390,51 @@ class MessageParser {
     return null;
   }
 
+  // Extract physical amenities / fittings the unit comes with.
+  // WhatsApp listings list these as terse lines ("1bed, 1almirah and 1Ac",
+  // "14 k with ac"). The LLM populates `amenities` only ~9% of the time, so we
+  // run this regex pass and MERGE it into whatever the LLM returned. Returns a
+  // de-duplicated array of canonical labels (matching the DB amenities TEXT[]).
+  extractAmenities(text) {
+    if (!text) return [];
+    const lower = text.toLowerCase();
+    // [canonical label, regex]. Order doesn't matter — output is de-duped.
+    // Anchors are letter-only lookarounds — (?<![a-z]) / (?![a-z]) — NOT \b,
+    // because listings glue the quantity to the word ("1bed", "1almirah",
+    // "1Ac"); a \b never sits between a digit and a letter, so \b-anchored
+    // patterns silently miss every quantified amenity. A leading digit is fine
+    // (it's not a letter); a leading/trailing letter is rejected so we don't
+    // match "ac" inside "place" or "bed" inside "bedroom".
+    const AMENITY_PATTERNS = [
+      ['AC',              /(?<![a-z])(?:a\.?c\.?|air[\s-]?cond(?:itioner|itioning)?)(?![a-z])/i],
+      ['bed',             /(?<![a-z])beds?(?![a-z])/i],
+      ['wardrobe',        /(?<![a-z])(?:almirah?s?|wardrobes?|cupboards?|cabinets?)(?![a-z])/i],
+      ['fridge',          /(?<![a-z])(?:fridges?|refrigerators?)(?![a-z])/i],
+      ['washing machine', /(?<![a-z])washing\s*machine(?![a-z])/i],
+      ['geyser',          /(?<![a-z])(?:geyser|water\s*heater)(?![a-z])/i],
+      ['sofa',            /(?<![a-z])sofa(?![a-z])/i],
+      ['TV',              /(?<![a-z])(?:tv|television)(?![a-z])/i],
+      ['dining table',    /(?<![a-z])dining\s*table(?![a-z])/i],
+      ['parking',         /(?<![a-z])(?:parking|car\s*park|garage)(?![a-z])/i],
+      ['lift',            /(?<![a-z])(?:lift|elevator)(?![a-z])/i],
+      ['balcony',         /(?<![a-z])balcon(?:y|ies)(?![a-z])/i],
+      ['modular kitchen', /(?<![a-z])modular\s*kitchen(?![a-z])/i],
+      ['kitchen',         /(?<![a-z])(?:kitchen|kitchenette)(?![a-z])/i],
+      ['gym',             /(?<![a-z])gym(?![a-z])/i],
+      ['pool',            /(?<![a-z])(?:swimming\s*)?pool(?![a-z])/i],
+      ['power backup',    /(?<![a-z])(?:power\s*backup|inverter|generator)(?![a-z])/i],
+      ['water supply',    /(?<![a-z])(?:24\s*(?:hours?|hrs?)\s*water|water\s*supply|water\s*facility)(?![a-z])/i],
+      ['gas pipeline',    /(?<![a-z])(?:gas\s*(?:pipeline|connection)|piped\s*gas)(?![a-z])/i],
+      ['wifi',            /(?<![a-z])(?:wi-?fi|internet)(?![a-z])/i],
+      ['security',        /(?<![a-z])(?:security|guard|cctv|gated)(?![a-z])/i],
+    ];
+    const found = new Set();
+    for (const [label, re] of AMENITY_PATTERNS) {
+      if (re.test(lower)) found.add(label);
+    }
+    return [...found];
+  }
+
   // Returns true when str matches a known area from any market.
   isKnownLocation(str) {
     if (!str) return false;
@@ -458,6 +510,137 @@ class MessageParser {
     return cleaned.split(/[.\n]/)[0].substring(0, 80) || text.substring(0, 60);
   }
 
+  // True when a string is a property attribute masquerading as a place name —
+  // "Independent Raw", "Fully Furnished", "2 BHK", "Separate entry", etc. These
+  // routinely leak out of the LLM into the location field. Keep this in sync
+  // with the dashboard's isLikelyLocation reject list (defense-in-depth there).
+  _isNonLocation(str) {
+    if (!str) return false;
+    return /\b(?:furnished|unfurnished|owner|story|storey|available|vacant|with\s+owner|independent|raw|bare|semi|separate|seprate|entry|\d*\s*(?:bhk|rk|bk|br))\b/i.test(str);
+  }
+
+  // Validate an LLM-provided location, falling back to text extraction when the
+  // candidate is missing or is actually a property attribute. Returns a clean
+  // place name or null. e.g. ("Independent Raw", "Alpha 2 Independent Raw 1rk…")
+  // → "Alpha 2".
+  sanitizeLocation(candidate, text) {
+    if (candidate && !this._isNonLocation(candidate)) return candidate;
+    return this.extractLocation(text) || null;
+  }
+
+  // Single deterministic post-LLM pass shared by the live worker and the batch
+  // reprocess tool. Mutates and returns `parsed`: validates/repairs location,
+  // and backfills price / currency / furnished / amenities the LLM dropped.
+  // Pure regex — no network, no cost — so it is safe to run on every message
+  // and to re-run over the whole table.
+  normalize(parsed, text) {
+    parsed = parsed || {};
+
+    // Location: validate the LLM value, repair from text, or clear if it was a
+    // bad value we couldn't replace (better NULL than "Independent Raw").
+    const candidate = parsed.community || parsed.area_text || parsed.location || null;
+    const loc = this.sanitizeLocation(candidate, text);
+    if (loc) {
+      parsed.community = loc;
+      parsed.area_text = loc;
+      parsed.location  = loc;
+    } else if (this._isNonLocation(parsed.community) || this._isNonLocation(parsed.area_text)) {
+      parsed.community = null;
+      parsed.area_text = null;
+      parsed.location  = null;
+    }
+
+    // Price (also sets this._lastCurrency as a side effect).
+    if (parsed.price == null) {
+      const p = this.extractPrice(text);
+      if (p != null) {
+        parsed.price = p;
+        if (!parsed.currency && this._lastCurrency) parsed.currency = this._lastCurrency;
+      }
+    }
+
+    // Furnished.
+    if (!parsed.furnished) {
+      const f = this.isFurnished(text);
+      if (f) parsed.furnished = f;
+    }
+
+    // Amenities — LLM populates these <10% of the time; union the regex pass in.
+    const regexAmenities = this.extractAmenities(text);
+    if (regexAmenities.length) {
+      parsed.amenities = [...new Set([...(parsed.amenities || []), ...regexAmenities])];
+    }
+
+    // Confidence must reflect the post-backfill data. The LLM scores confidence
+    // BEFORE we repair price/location, so a row we just gave a valid price+area
+    // could still sit below the dashboard's min_confidence gate and be hidden.
+    // Recompute and take the higher value — never lower the LLM's own score.
+    const recomputed = this.calculateConfidence(parsed, text);
+    if (parsed.confidence == null || recomputed > parsed.confidence) {
+      parsed.confidence = recomputed;
+    }
+
+    // Final deterministic guardrail. Runs LAST so it can override the raise-only
+    // rule above: a confident-but-impossible extraction (the class the LLM is
+    // *sure* about, which the confidence gate can't catch) is quarantined here.
+    this._sanityCheck(parsed, text);
+
+    return parsed;
+  }
+
+  // Plausibility guardrail — the automated catch for confident hallucinations.
+  // Sets parsed.quarantine_reason and forces confidence to 0 when a value is
+  // impossible for a real listing, so the dashboard min_confidence gate hides
+  // it with no human in the loop. NULL reason = clean. Deliberately conservative
+  // (a wrong price shown to a user is worse than a rare real outlier hidden);
+  // bands are tunable below. Idempotent: re-running over raw_messages re-derives
+  // and re-quarantines, so improving this heals every existing row in one pass.
+  _sanityCheck(parsed, text) {
+    const prior = parsed.quarantine_reason;
+    // Verdict-style quarantines come from the LLM (not_a_listing) or a human
+    // (user_flagged). A free regex re-derive must never overturn them — only the
+    // LLM (--full) or a person can lift them. This function OWNS only the
+    // deterministic 'implausible_*' reasons.
+    const isVerdict = prior && /^(user_flagged|not_a_listing)/.test(prior);
+
+    // The LLM judged this isn't a property at all (vehicle/job/service/chat).
+    // Honor it: quarantine so the raise-only confidence recompute can't un-hide a
+    // non-listing whose stray number (a salary, a resale price) looks plausible.
+    // This is the class the price-band checks below CAN'T catch.
+    if (parsed.is_listing === false) {
+      return this._quarantine(parsed, 'not_a_listing');
+    }
+    if (isVerdict) { parsed.confidence = 0; return parsed; }
+
+    parsed.quarantine_reason = null;  // default clean; overwritten below on failure
+    const price = parsed.price != null ? Number(parsed.price) : null;
+    if (price == null || isNaN(price)) return parsed;
+
+    // Floor: no real rent or sale is <= a few units of any currency. Catches the
+    // "7 INR" class of misparse.
+    if (price > 0 && price <= MessageParser.PRICE_FLOOR) {
+      return this._quarantine(parsed, `implausible_price_low:${price}`);
+    }
+    // Rent ceiling: a recurring rent above the band is almost always a misparse
+    // (e.g. "4500k chalo" → 4,500,000). Sales legitimately reach crores, so the
+    // ceiling is applied to rent only.
+    const isRent = parsed.intent === 'rent' || !!parsed.rent_period;
+    if (isRent) {
+      const cur = (parsed.currency || 'INR').toUpperCase();
+      const ceiling = MessageParser.RENT_CEILING[cur] ?? MessageParser.RENT_CEILING.DEFAULT;
+      if (price > ceiling) {
+        return this._quarantine(parsed, `implausible_rent_high:${price}${cur}`);
+      }
+    }
+    return parsed;
+  }
+
+  _quarantine(parsed, reason) {
+    parsed.quarantine_reason = reason;
+    parsed.confidence = 0;   // below the dashboard min_confidence gate → auto-hidden
+    return parsed;
+  }
+
   parse(text, senderName) {
     const price    = this.extractPrice(text);           // also sets this._lastCurrency
     const locHit   = this._matchLocation(text);         // { name, currency } | null
@@ -486,6 +669,7 @@ class MessageParser {
       property_type: this.guessType(text),
       area_sqft: this.extractArea(text),
       furnished: this.isFurnished(text),
+      amenities: this.extractAmenities(text),
       parking: this.hasParking(text),
       agent_phone: this.extractPhone(text),
       agent_name: senderName,
@@ -495,6 +679,12 @@ class MessageParser {
     return parsed;
   }
 }
+
+// Sanity bands for _sanityCheck — tune as the data teaches us. Floor catches
+// absurd-low misparses ("7 INR"); rent ceilings catch the thousands-suffix
+// expansion ("4500k" → 4.5M). Sales are intentionally uncapped.
+MessageParser.PRICE_FLOOR  = 100;
+MessageParser.RENT_CEILING = { INR: 2000000, AED: 2000000, USD: 100000, DEFAULT: 2000000 };
 
 const parserInstance = new MessageParser();
 

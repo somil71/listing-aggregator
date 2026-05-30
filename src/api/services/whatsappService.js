@@ -51,6 +51,9 @@ const DATA_DIR = path.resolve(__dirname, '../../../data');
 // reads a partial file if it polls exactly during our write.
 function writeCmdAtomic(cmdFile, payload) {
   const tmp = cmdFile + '.tmp';
+  // Stamp every command with a wall-clock ts so the bridge can ignore
+  // commands that predate its own boot (defeats the disconnect/initiate race).
+  if (payload && payload.ts == null) payload = { ...payload, ts: Date.now() };
   fs.writeFileSync(tmp, JSON.stringify(payload));
   try { fs.renameSync(tmp, cmdFile); } catch (_) {
     // On Windows rename can fail if target is locked; fall back to direct write
@@ -279,11 +282,14 @@ class WhatsAppService {
     // Remove only Chromium SingletonLock files (release the profile without
     // wiping the saved login).  If the saved login is actually corrupt the
     // bridge will throw and we'll wipe + retry below.
+    // wppconnect stores the Chromium profile at <folderNameToken>/<session>,
+    // i.e. authDir/<userId> (NOT session-<userId>). The lock files live there.
+    const profileDir = path.join(authDir, userId);
     const stalePaths = [
-      path.join(authDir, `session-${userId}`, 'SingletonLock'),
-      path.join(authDir, `session-${userId}`, 'SingletonCookie'),
-      path.join(authDir, `session-${userId}`, 'SingletonSocket'),
-      path.join(authDir, `session-${userId}`, 'lockfile'),
+      path.join(profileDir, 'SingletonLock'),
+      path.join(profileDir, 'SingletonCookie'),
+      path.join(profileDir, 'SingletonSocket'),
+      path.join(profileDir, 'lockfile'),
     ];
     for (const f of stalePaths) {
       try { fs.unlinkSync(f); } catch (_) {}
@@ -300,6 +306,13 @@ class WhatsAppService {
     console.log(`[whatsapp] Spawning bridge for ${userId}`);
     // Reset the state file so old events from a prior run aren't re-played
     try { fs.writeFileSync(stateFile, ''); } catch (_) {}
+    // Clear any stale command file left by a previous session (e.g. a
+    // 'disconnect' from the dashboard's reconnect flow). Otherwise the
+    // freshly-spawned bridge polls it on boot and immediately shuts down.
+    try { fs.unlinkSync(cmdFile); } catch (_) {}
+    try { fs.unlinkSync(cmdFile + '.tmp'); } catch (_) {}
+    // Same for the Redis command queue (multi-instance path).
+    try { await bridgeBus.clearCommands(userId); } catch (_) {}
 
     const child = spawn(
       process.execPath,
@@ -400,6 +413,20 @@ class WhatsAppService {
          VALUES (COALESCE((SELECT id FROM whatsapp_sessions WHERE user_id=?),?),?,'ready',?,CURRENT_TIMESTAMP)`,
         [userId, uuidv4(), userId, data.phone]
       );
+      // Resumed session → recover anything missed during downtime. Wait ~10s
+      // first so WhatsApp Web has begun streaming the backlog from the phone;
+      // backfillGroup then waits for the per-chat sync to settle before
+      // harvesting, so the gap messages are captured rather than skipped.
+      if (this._autoBackfillPending?.has(userId)) {
+        this._autoBackfillPending.delete(userId);
+        setTimeout(() => {
+          const e = this.clients.get(userId);
+          if (!e || !e.ready) return;  // disconnected in the meantime
+          console.log(`[whatsapp] auto-backfill after resume for ${userId}`);
+          bridgeBus.sendCommand(userId, { cmd: 'rescrape' }).catch(() => {});
+          try { writeCmdAtomic(e.cmdFile, { cmd: 'rescrape' }); } catch (_) {}
+        }, 10000);
+      }
     } else if (type === 'groups_progress') {
       // Forward sync status so the dashboard can show "Syncing chats…" instead
       // of an instant "no groups found" while wppconnect is still hydrating.
@@ -431,9 +458,18 @@ class WhatsAppService {
       this.clients.delete(userId);
       this._emit(userId, 'disconnected', { message: `Disconnected: ${data.reason}` });
     } else if (type === 'error') {
-      console.error(`[whatsapp] bridge error for ${userId}:`, data.message);
+      const raw = String(data.message || 'Unknown error');
+      console.error(`[whatsapp] bridge error for ${userId}:`, raw);
       this._initializing?.delete(userId);
-      this._emit(userId, 'error', { message: data.message });
+      // Clean wppconnect's internal stack-trace noise before forwarding —
+      // users should never see "static.whatsapp.net/...js:7" line refs.
+      const cleaned = raw
+        .replace(/https?:\/\/[^\s)]+/g, '')
+        .replace(/[A-Za-z0-9_-]+\.js:\d+(?::\d+)?/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 200);
+      this._emit(userId, 'error', { message: cleaned, raw });
       this._stopTailer(userId);
       this.clients.delete(userId);
     } else if (type === 'monitoring_started') {
@@ -443,6 +479,8 @@ class WhatsAppService {
       console.log(`[whatsapp] backfill start: ${data.groupName} target=${data.targetCount}`);
     } else if (type === 'backfill_methods') {
       console.log(`[whatsapp] backfill methods for ${data.groupName}:`, JSON.stringify(data.has));
+    } else if (type === 'backfill_synced') {
+      console.log(`[whatsapp] sync settled for ${data.groupName}: ${data.loaded} messages loaded`);
     } else if (type === 'backfill_scrolled') {
       console.log(`[whatsapp] scroll-loaded ${data.groupName}: ${data.finalCount} messages in chat`);
     } else if (type === 'backfill_loaded') {
@@ -462,6 +500,11 @@ class WhatsAppService {
     } else if (type === 'listing_stored') {
       // Live notification when the parser extracts a listing from a real-time msg
       this._emit(userId, 'listing_stored', data);
+    } else if (type === 'backfill_warning') {
+      // Per-group, non-fatal — forward verbatim. The dashboard will log it
+      // in the status feed but stays in its current phase (no error UI).
+      this._emit(userId, 'backfill_warning', data);
+      console.warn(`[whatsapp] backfill warning for ${userId}: ${data.groupName} ${data.reason} — ${data.message}`);
     }
     // boot / shutting_down / listener_wired / monitoring are info-only
   }
@@ -634,6 +677,71 @@ class WhatsAppService {
       `UPDATE whatsapp_sessions SET status='disconnected', updated_at=CURRENT_TIMESTAMP WHERE user_id=?`,
       [userId]
     );
+  }
+
+  // ── Auto-resume on server start ──────────────────────────────────────────
+  // After a server restart, the bridge subprocesses are gone but the
+  // wppconnect auth tokens are still on disk under data/wwebjs-auth/<userId>.
+  // We respawn the bridge for every user with a valid saved profile so they
+  // don't have to click "Connect WhatsApp" again. wppconnect detects the
+  // saved tokens and skips the QR scan — it goes straight to 'ready' and
+  // re-wires the message listener.
+  //
+  // IMPORTANT: the on-disk profile is the ONLY reliable source of truth here.
+  // The whatsapp_sessions row is written to SQLite (via dbRun) and frequently
+  // lags reality (e.g. shows 'disconnected' after a crash even though the
+  // login is still valid), so we DO NOT gate resume on its status. We scan the
+  // auth dir directly and let wppconnect decide if the saved login still works.
+  async autoResumeBridges() {
+    try {
+      const authRoot = path.join(DATA_DIR, 'wwebjs-auth');
+      if (!fs.existsSync(authRoot)) {
+        console.log('[whatsapp] auto-resume: no auth dir, nothing to restore');
+        return { resumed: 0 };
+      }
+
+      // Each immediate subdir of wwebjs-auth is a userId. wppconnect stores the
+      // Chromium profile at <authDir>/<userId>/<userId>, and a usable profile
+      // always has a 'Default' subfolder (holds the WhatsApp Local Storage /
+      // IndexedDB that backs the login). Anything without it is an empty/broken
+      // shell and would only produce a fresh QR — skip it.
+      const candidates = fs.readdirSync(authRoot, { withFileTypes: true })
+        .filter(d => d.isDirectory())
+        .map(d => d.name)
+        .filter(userId => fs.existsSync(path.join(authRoot, userId, userId, 'Default')));
+
+      if (!candidates.length) {
+        console.log('[whatsapp] auto-resume: no saved profiles to restore');
+        return { resumed: 0 };
+      }
+
+      let resumed = 0;
+      for (const userId of candidates) {
+        // Don't spawn if we already have a live client for this user
+        if (this.clients.has(userId)) continue;
+
+        try {
+          console.log(`[whatsapp] auto-resume: spawning bridge for ${userId}`);
+          // Mark this session so that, once the bridge reaches 'ready', the
+          // server kicks off a one-time backfill. A resumed bridge only
+          // captures messages that arrive AFTER it reconnects — anything sent
+          // while the server/bridge was down must be recovered explicitly, or
+          // it's silently lost until the user manually hits "Refetch chats".
+          if (!this._autoBackfillPending) this._autoBackfillPending = new Set();
+          this._autoBackfillPending.add(userId);
+          await this.initiateQR(userId);
+          resumed++;
+        } catch (err) {
+          console.warn(`[whatsapp] auto-resume failed for ${userId}: ${err.message}`);
+        }
+      }
+
+      console.log(`[whatsapp] auto-resume: ${resumed}/${candidates.length} bridge(s) restored`);
+      return { resumed };
+    } catch (err) {
+      console.error('[whatsapp] autoResumeBridges error:', err.message);
+      return { resumed: 0, error: err.message };
+    }
   }
 }
 

@@ -33,6 +33,17 @@ Return ONLY a JSON object (no markdown fences) with these fields:
   "confidence": number             // your own 0-1 confidence in this extraction
 }
 
+NOT A PROPERTY LISTING — check this FIRST, before anything else:
+If the message is not a real-estate post — a vehicle (car/bike/scooter: "2018 model", "km driven",
+"chalu/chalo condition", "RC", "insurance"), a job/hiring post, a product/service ad, or general chat —
+you MUST return: is_listing=false, intent=null, confidence=0, and null for price, community, area_text.
+Do NOT force a property interpretation onto a non-property message. A vehicle priced "4500k" is NOT a
+4,500,000 rent; a job "salary 18k" is NOT an 18,000 rent.
+Examples (note the null/0 output):
+  "2018 model\n4500k chalo huiii hai\n95k" → {"is_listing":false,"intent":null,"price":null,"confidence":0}
+  "Urgent hiring: delivery boys, salary 18k/month, call 98xxxxxxxx" → {"is_listing":false,"intent":null,"price":null,"confidence":0}
+  "Selling iPhone 13 128gb, 45k, mint condition" → {"is_listing":false,"intent":null,"price":null,"confidence":0}
+
 INTENT DETECTION — follow this decision tree, stop at first match:
 1. "wanted"/"looking for"/"need"/"require"/"searching" → intent = "wanted"
 2. "roommate"/"flatmate"/"room partner"/"room share" → intent = "roommate"
@@ -275,10 +286,22 @@ Return ONLY valid JSON in the same schema as before.`;
 
   // Public so dual-parser can normalise Gemini's raw JSON through the same path
   _normaliseLlmOutput(parsed, senderName) {
+    // Crash this listing's confidence if the LLM explicitly said it isn't a
+    // real estate message. The DB-side filter then drops it from the
+    // dashboard, but we still keep the row for analytics/debug.
+    const isListing = parsed.is_listing;
+    const confidence = typeof parsed.confidence === 'number'
+      ? Math.max(0, Math.min(1, parsed.confidence))
+      : 0.5;
+    const adjustedConfidence = isListing === false ? 0 : confidence;
+
     return {
-      is_listing: parsed.is_listing ?? null,
+      is_listing: isListing ?? null,
       intent: parsed.intent ?? null,
-      property_type: parsed.property_type ?? 'apartment',
+      // NEVER default property_type — let nulls flow through so the dashboard
+      // filter can detect non-properties (bikes, services, classified ads,
+      // etc.) that the LLM correctly refused to classify.
+      property_type: parsed.property_type ?? null,
       unit_type: this._normUnitType(parsed.unit_type),
       bedrooms: parsed.bedrooms ?? null,
       bathrooms: parsed.bathrooms ?? null,
@@ -295,9 +318,7 @@ Return ONLY valid JSON in the same schema as before.`;
       vacant: parsed.vacant ?? null,
       agent_phone: parsed.agent_phone ?? null,
       agent_name: senderName || null,
-      confidence: typeof parsed.confidence === 'number'
-        ? Math.max(0, Math.min(1, parsed.confidence))
-        : 0.5,
+      confidence: adjustedConfidence,
       parking: parsed.amenities?.some(a => /parking/i.test(a)) ? 1 : 0,
       raw_llm_json: parsed,
     };

@@ -37,6 +37,7 @@ interface Listing {
   sender_name: string | null;
   has_media: boolean | null;
   media_keys: string[] | null;   // e.g. ["/app/data/media/abc123.jpg"]
+  repost_count: number | string | null;  // times this exact message was re-posted by the same sender
 }
 
 interface ScrapeStats {
@@ -68,12 +69,13 @@ interface ActiveFilters {
   rent_period:   string;
   min_price:     string;
   max_price:     string;
+  min_reposts:   string;   // '' | '2' | '3' | '5' — only show listings reposted ≥ N times
 }
 
 const EMPTY_FILTERS: ActiveFilters = {
   intent: '', bedrooms: '', unit_type: '', location: '',
   property_type: '', furnished: '', rent_period: '',
-  min_price: '', max_price: '',
+  min_price: '', max_price: '', min_reposts: '',
 };
 
 // Phone helpers live in dashboard/src/utils/phone.ts so both DashboardPage
@@ -118,7 +120,7 @@ const guessLocationFromText = (text: string | null): string | null => {
 // it starts with "Fully", not "Furnished".
 const isLikelyLocation = (str: string | null): boolean => {
   if (!str) return false;
-  const nonLocRe = /\b(?:furnished|unfurnished|owner|story|storey|available|vacant|with\s+owner)\b/i;
+  const nonLocRe = /\b(?:furnished|unfurnished|owner|story|storey|available|vacant|with\s+owner|independent|raw|bare|semi|separate|seprate|entry|\d*\s*(?:bhk|rk|bk|br))\b/i;
   return !nonLocRe.test(str);
 };
 
@@ -153,16 +155,19 @@ const intentBadge = (intent: string | null) => {
 // Extracted as its own component to avoid JSX-multiple-siblings errors inside
 // the DashboardPage JSX tree.  All values are dynamic from the API.
 
-const SELECT_BASE = 'text-xs font-bold rounded-xl px-3 py-1.5 border outline-none cursor-pointer transition-all';
+// Stacked control: a small uppercase label sitting above a full-width select.
+// Every control shares the same footprint so the filter grid lines up cleanly
+// instead of the old inline label+select that wrapped at odd points.
+const SELECT_BASE = 'w-full text-xs font-bold rounded-xl px-3 py-2 border outline-none cursor-pointer transition-all';
 const SELECT_ON   = 'bg-blue-600 text-white border-blue-600';
-const SELECT_OFF  = 'bg-slate-50 text-slate-700 border-slate-200 hover:border-blue-300';
+const SELECT_OFF  = 'bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-slate-200 dark:border-slate-700 hover:border-blue-300';
 
 function FilterSelect({
   label, value, options, onChange,
 }: { label: string; value: string; options: { value: string; label: string }[]; onChange: (v: string) => void }) {
   return (
-    <div className="flex items-center gap-1.5">
-      <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest whitespace-nowrap">{label}</span>
+    <div className="flex flex-col gap-1.5">
+      <span className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">{label}</span>
       <select
         value={value}
         onChange={e => onChange(e.target.value)}
@@ -221,9 +226,10 @@ function FilterBar({
         </p>
       )}
 
-      {/* Filter controls */}
+      {/* Filter controls — uniform grid so every control aligns instead of
+          wrapping at ragged points. */}
       {hasAnyOption && (
-        <div className="flex flex-wrap gap-3 items-center">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-x-4 gap-y-3 items-end">
           {options.intents.length > 0 && (
             <FilterSelect
               label="Intent"
@@ -282,23 +288,39 @@ function FilterBar({
               onChange={v => onUpdate('rent_period', v)}
             />
           )}
+          {/* Reposts — eager-seller filter. Always available; doesn't depend on
+              option lists since it's computed server-side from repost_count. */}
+          <FilterSelect
+            label="Reposts"
+            value={active.min_reposts}
+            options={[
+              { value: '2', label: 'Reposted 2+×' },
+              { value: '3', label: 'Reposted 3+×' },
+              { value: '5', label: 'Reposted 5+×' },
+            ]}
+            onChange={v => onUpdate('min_reposts', v)}
+          />
           {options.price_ranges.length > 0 && (
-            <div className="flex items-center gap-1.5">
-              <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Price</span>
-              {['min_price', 'max_price'].map(k => (
-                <input
-                  key={k}
-                  type="number"
-                  placeholder={`${k === 'min_price' ? 'Min' : 'Max'} (${options.price_ranges[0].currency})`}
-                  value={active[k as keyof ActiveFilters]}
-                  onChange={e => onUpdate(k as keyof ActiveFilters, e.target.value)}
-                  className={`w-28 text-xs font-bold rounded-xl px-3 py-1.5 border outline-none transition-all ${
-                    active[k as keyof ActiveFilters]
-                      ? 'border-blue-400 bg-blue-50 text-blue-700'
-                      : 'border-slate-200 bg-slate-50 text-slate-700'
-                  }`}
-                />
-              ))}
+            <div className="flex flex-col gap-1.5 col-span-2">
+              <span className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">
+                Price ({options.price_ranges[0].currency})
+              </span>
+              <div className="flex items-center gap-2">
+                {['min_price', 'max_price'].map(k => (
+                  <input
+                    key={k}
+                    type="number"
+                    placeholder={k === 'min_price' ? 'Min' : 'Max'}
+                    value={active[k as keyof ActiveFilters]}
+                    onChange={e => onUpdate(k as keyof ActiveFilters, e.target.value)}
+                    className={`w-full text-xs font-bold rounded-xl px-3 py-2 border outline-none transition-all ${
+                      active[k as keyof ActiveFilters]
+                        ? 'border-blue-400 bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-300'
+                        : 'border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-200'
+                    }`}
+                  />
+                ))}
+              </div>
             </div>
           )}
         </div>
@@ -318,6 +340,7 @@ function FilterBar({
           {active.rent_period   && <Chip label={active.rent_period}   onRemove={() => onUpdate('rent_period', '')} />}
           {active.min_price     && <Chip label={`≥ ${active.min_price}`} onRemove={() => onUpdate('min_price', '')} />}
           {active.max_price     && <Chip label={`≤ ${active.max_price}`} onRemove={() => onUpdate('max_price', '')} />}
+          {active.min_reposts   && <Chip label={`Reposted ${active.min_reposts}+×`} onRemove={() => onUpdate('min_reposts', '')} />}
         </div>
       )}
     </div>
@@ -349,6 +372,10 @@ export default function DashboardPage() {
   const [searchTerm, setSearchTerm] = useState('');
   const [scrapeStats, setScrapeStats] = useState<ScrapeStats | null>(null);
   const [showLowConfidence, setShowLowConfidence] = useState(false);
+  const [showNonProperty, setShowNonProperty] = useState(false);
+  // total = server-side count of all matching rows (before LIMIT/OFFSET).
+  // We use it to drive pagination + show the user how many more exist.
+  const [total, setTotal] = useState(0);
   const [filterOptions, setFilterOptions] = useState<FilterOptions>({
     locations: [], configurations: [], price_ranges: [],
     intents: [], property_types: [], furnished: [], rent_periods: [],
@@ -357,13 +384,13 @@ export default function DashboardPage() {
   // Prevent double-fetch from activeFilters effect firing on initial mount
   const filtersInitialized = useRef(false);
 
-  // Fetch listings + stats on mount, and whenever confidence toggle changes
+  // Fetch listings + stats on mount, and whenever confidence/non-property toggle changes
   useEffect(() => {
     fetchListings();
     fetchScrapeStats();
     fetchFilterOptions();
     filtersInitialized.current = true;
-  }, [showLowConfidence]);
+  }, [showLowConfidence, showNonProperty]);
 
   // Re-fetch listings (only) when filters change — skip initial render
   useEffect(() => {
@@ -373,6 +400,7 @@ export default function DashboardPage() {
     activeFilters.intent, activeFilters.bedrooms, activeFilters.unit_type,
     activeFilters.location, activeFilters.property_type, activeFilters.furnished,
     activeFilters.rent_period, activeFilters.min_price, activeFilters.max_price,
+    activeFilters.min_reposts,
   ]);
 
   const authHeaders = async () => {
@@ -380,13 +408,21 @@ export default function DashboardPage() {
     return { Authorization: `Bearer ${token}` };
   };
 
-  const fetchListings = async () => {
+  const fetchListings = async (append = false) => {
     setLoading(true);
     try {
       const headers = await authHeaders();
       const minConf = showLowConfidence ? 0 : 0.2;
 
       const params = new URLSearchParams({ min_confidence: String(minConf) });
+      // Pull 250 at a time (server cap is 500). For "Load more" we send the
+      // current offset so the second page picks up where the first left off.
+      params.set('limit', '250');
+      if (append) params.set('offset', String(listings.length));
+      // Default behaviour hides non-property mis-classifications (bikes,
+      // services, etc.). User can opt-in via the toggle.
+      if (showNonProperty) params.set('include_non_property', 'true');
+
       // Append only non-empty active filters — all values come from the user's actual data
       if (activeFilters.intent)        params.set('intent',        activeFilters.intent);
       if (activeFilters.location)      params.set('location',      activeFilters.location);
@@ -395,14 +431,17 @@ export default function DashboardPage() {
       if (activeFilters.rent_period)   params.set('rent_period',   activeFilters.rent_period);
       if (activeFilters.min_price)     params.set('min_price',     activeFilters.min_price);
       if (activeFilters.max_price)     params.set('max_price',     activeFilters.max_price);
+      if (activeFilters.min_reposts)   params.set('min_reposts',   activeFilters.min_reposts);
       // bedrooms + unit_type are sent together (unit_type alone is not useful)
       if (activeFilters.bedrooms)      params.set('bedrooms',      activeFilters.bedrooms);
       if (activeFilters.bedrooms && activeFilters.unit_type)
                                        params.set('unit_type',     activeFilters.unit_type);
 
       const res = await axios.get(`/api/listings/today?${params.toString()}`, { headers });
-      setListings(res.data.data.listings);
+      const next = res.data.data.listings ?? [];
+      setListings(append ? prev => [...prev, ...next] : next);
       setStats(res.data.data.statistics);
+      setTotal(res.data.data.pagination?.total ?? next.length);
     } catch (err) {
       console.error(err);
     } finally {
@@ -601,18 +640,35 @@ export default function DashboardPage() {
             />
 
             {/* Table toolbar */}
-            <div className="flex items-center justify-between">
-              <div className="text-xs font-black text-slate-500 uppercase tracking-widest">
-                Listings ({filtered.length}{activeFilterCount > 0 ? ` filtered` : ''})
+            <div className="flex items-center justify-between flex-wrap gap-3">
+              <div className="text-xs font-black text-slate-500 dark:text-slate-400 uppercase tracking-widest">
+                Listings ({filtered.length}
+                {filtered.length < listings.length ? ` of ${listings.length} loaded` : ''}
+                {total > listings.length ? `, ${total - listings.length} more available` : ''}
+                {activeFilterCount > 0 ? ` · filtered` : ''})
               </div>
-              <button
-                onClick={() => setShowLowConfidence(v => !v)}
-                className="flex items-center gap-2 px-3 py-1.5 text-xs font-bold rounded-xl border border-slate-200 hover:bg-slate-50 text-slate-700"
-                title="Toggle to include low-confidence parsed messages"
-              >
-                {showLowConfidence ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                {showLowConfidence ? 'Hide low-confidence' : 'Show all scraped'}
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setShowNonProperty(v => !v)}
+                  className={`flex items-center gap-2 px-3 py-1.5 text-xs font-bold rounded-xl border transition-colors ${
+                    showNonProperty
+                      ? 'bg-amber-50 dark:bg-amber-900/30 border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-300'
+                      : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300'
+                  }`}
+                  title="Bikes, services, classifieds — anything mis-classified as a flat"
+                >
+                  {showNonProperty ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+                  {showNonProperty ? 'Hiding non-property' : 'Show non-property too'}
+                </button>
+                <button
+                  onClick={() => setShowLowConfidence(v => !v)}
+                  className="flex items-center gap-2 px-3 py-1.5 text-xs font-bold rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 transition-colors"
+                  title="Toggle to include low-confidence parsed messages"
+                >
+                  {showLowConfidence ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                  {showLowConfidence ? 'Hide low-confidence' : 'Show all scraped'}
+                </button>
+              </div>
             </div>
 
             {/* Table */}
@@ -649,6 +705,7 @@ export default function DashboardPage() {
                       const contactPhone = sanitizePhone(l.agent_phone) || senderPhone;
                       const displayName = toDisplayName(l.agent_name) || toDisplayName(l.sender_name);
                       const title = listingTitle(l);
+                      const reposts = parseInt(String(l.repost_count ?? 1), 10) || 1;
 
                       return (
                         <tr key={l.id} className="hover:bg-slate-50 dark:hover:bg-slate-800/40 transition-colors cursor-pointer" onClick={() => navigate(`/listing/${l.id}`)}>
@@ -661,12 +718,20 @@ export default function DashboardPage() {
                               <div>
                                 <div className="flex items-center gap-2 flex-wrap">
                                   {title
-                                    ? <div className="font-black text-slate-900 uppercase tracking-tight text-sm">{title}</div>
-                                    : <div className="font-medium text-slate-300 text-sm italic">No location</div>
+                                    ? <div className="font-black text-slate-900 dark:text-slate-100 uppercase tracking-tight text-sm">{title}</div>
+                                    : <div className="font-medium text-slate-300 dark:text-slate-500 text-sm italic">No location</div>
                                   }
                                   <span className={`text-[9px] font-black uppercase px-1.5 py-0.5 rounded ${confClass}`}>
                                     {Math.round(conf * 100)}%
                                   </span>
+                                  {reposts > 1 && (
+                                    <span
+                                      title={`Re-posted ${reposts}× by this sender — likely an eager seller`}
+                                      className="text-[9px] font-black uppercase px-1.5 py-0.5 rounded bg-orange-100 text-orange-700 dark:bg-orange-500/20 dark:text-orange-300"
+                                    >
+                                      ↻ {reposts}×
+                                    </span>
+                                  )}
                                   {l.has_media && (
                                     <span title="Has photos/videos" className="text-[10px] text-slate-400">📷</span>
                                   )}
@@ -685,7 +750,7 @@ export default function DashboardPage() {
                                   <span className="text-[9px] font-bold uppercase px-2 py-0.5 rounded bg-slate-100 text-slate-500 capitalize">{l.property_type}</span>
                                 )}
                               </div>
-                              <div className="flex items-center gap-3 text-sm font-bold text-slate-700">
+                              <div className="flex items-center gap-3 text-sm font-bold text-slate-700 dark:text-slate-200">
                                 {fmtBeds(l.bedrooms, l.unit_type)
                                   ? <span className="flex items-center gap-1"><Bed className="w-3.5 h-3.5 text-slate-300" /> {fmtBeds(l.bedrooms, l.unit_type)}</span>
                                   : <span className="text-slate-300">—</span>
@@ -700,7 +765,7 @@ export default function DashboardPage() {
 
                           {/* Sender */}
                           <td className="px-6 py-5">
-                            <div className="text-xs font-bold text-slate-700 leading-relaxed">
+                            <div className="text-xs font-bold text-slate-700 dark:text-slate-200 leading-relaxed">
                               {displayName && (
                                 <div className="flex items-center gap-1"><User className="w-3 h-3 text-slate-300" /> {displayName}</div>
                               )}
@@ -733,6 +798,21 @@ export default function DashboardPage() {
                 </table>
               )}
             </div>
+
+            {/* Load more — only when the server has additional rows beyond
+                what's currently in state. Append (don't replace) so the user
+                doesn't lose their scroll position. */}
+            {total > listings.length && (
+              <div className="flex justify-center pt-2">
+                <button
+                  onClick={() => fetchListings(true)}
+                  disabled={loading}
+                  className="px-6 py-2.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-sm font-bold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50 transition-colors"
+                >
+                  {loading ? 'Loading…' : `Load ${Math.min(250, total - listings.length)} more (${total - listings.length} remaining)`}
+                </button>
+              </div>
+            )}
           </div>
         </div>
       </main>
