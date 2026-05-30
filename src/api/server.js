@@ -106,6 +106,52 @@ const pgPoolSaturation = new promClient.Gauge({
   registers: [metricsRegistry],
 });
 
+// ── Postgres schema bootstrap — runs on every cold start ─────────────────────
+// Applies any .sql migration files in src/db/postgres/ that haven't been run yet.
+// Applied migrations are tracked in schema_migrations so each file runs exactly once.
+// Failures throw — the server must not start with an incomplete schema.
+async function runPostgresMigrations() {
+  const migrationsDir = path.resolve(__dirname, '../db/postgres');
+  const files = fs.readdirSync(migrationsDir)
+    .filter(f => f.endsWith('.sql'))
+    .sort();
+
+  const client = await pg.pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        name       TEXT PRIMARY KEY,
+        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    for (const file of files) {
+      const { rows } = await client.query(
+        'SELECT 1 FROM schema_migrations WHERE name = $1', [file]
+      );
+      if (rows.length > 0) {
+        logger.debug(`PG migration already applied: ${file}`);
+        continue;
+      }
+
+      const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
+      try {
+        await client.query('BEGIN');
+        await client.query(sql);
+        await client.query('INSERT INTO schema_migrations (name) VALUES ($1)', [file]);
+        await client.query('COMMIT');
+        logger.info(`PG migration applied: ${file}`);
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        logger.error(`PG migration FAILED: ${file} — ${err.message}`);
+        throw err;
+      }
+    }
+  } finally {
+    client.release();
+  }
+}
+
 // ── SQLite schema bootstrap (legacy — non-fatal) ─────────────────────────────
 // These are idempotent IF NOT EXISTS statements for the SQLite side-car used by
 // the WhatsApp bridge.  Failures are logged and skipped rather than crashing the
@@ -1354,6 +1400,7 @@ let httpServer = null;
 
 async function startServer() {
   try {
+    await runPostgresMigrations();
     await runMigrations();
     httpServer = app.listen(config.port, () =>
       logger.info(`Server running at http://localhost:${config.port}`, {
