@@ -97,7 +97,17 @@ router.get('/status', authenticate, _withWhatsappBreaker(
 ));
 
 // ── List all groups from connected phone ───────────────────────────────────
-router.get('/groups', authenticate, _withWhatsappBreaker(
+// Guard before the circuit breaker so a "not connected" user state never
+// counts as a breaker failure (which would trip the breaker after 5 opens).
+router.get('/groups', authenticate, async (req, res, next) => {
+  if (!whatsappService.isConnected(req.userId)) {
+    return res.status(409).json({
+      success: false,
+      error: 'WhatsApp is not connected. Please scan the QR code first.',
+    });
+  }
+  return next();
+}, _withWhatsappBreaker(
   async (req) => ({ groups: await whatsappService.getGroups(req.userId) })
 ));
 

@@ -47,7 +47,15 @@ export default function GroupSelectionModal({ onClose, onSaved }: Props) {
   useEffect(() => {
     api.getGroups()
       .then(res => setGroups(res.data?.groups ?? []))
-      .catch(() => setError('Failed to load groups. Make sure WhatsApp is connected.'))
+      .catch((err: any) => {
+        if (err?.status === 409) {
+          // Bridge disconnected between QR auth and modal open — close and let
+          // the user re-scan the QR rather than showing a dead-end error screen.
+          onClose();
+        } else {
+          setError('Failed to load groups. Make sure WhatsApp is connected.');
+        }
+      })
       .finally(() => setLoading(false));
   }, []);
 

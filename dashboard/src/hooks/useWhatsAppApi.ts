@@ -30,7 +30,10 @@ export function useWhatsAppApi() {
       const res = await fetch('/api/v1/whatsapp/groups', {
         headers: await authHeaders(),
       });
-      if (!res.ok) throw new Error('Failed to get groups');
+      if (!res.ok) {
+        const err = Object.assign(new Error('Failed to get groups'), { status: res.status });
+        throw err;
+      }
       return res.json();
     },
 
