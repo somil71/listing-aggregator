@@ -19,6 +19,20 @@ const { MessageParser } = require('./message-parser');
 let bridgeBus = null;
 try { bridgeBus = require('../api/services/bridgeBus'); } catch (_) {}
 
+// Lazy Postgres handle. The monitored-groups list MUST come from Postgres
+// (Neon, external → survives redeploys); the SQLite copy lives on the
+// container's ephemeral disk and is wiped on every deploy. pool.js throws if
+// DATABASE_URL is unset, so guard the require and fall back to SQLite.
+let _pg = null;
+let _pgTried = false;
+function getPg() {
+  if (_pgTried) return _pg;
+  _pgTried = true;
+  try { _pg = require('../db/postgres/pool'); }
+  catch (err) { process.stderr.write(`[bridge] Postgres unavailable, using SQLite: ${err.message}\n`); _pg = null; }
+  return _pg;
+}
+
 const MEDIA_DIR = path.resolve(__dirname, '../../data/media');
 const parser = new MessageParser();
 
@@ -179,15 +193,36 @@ async function persistMessage(message, groupName) {
 }
 
 async function loadMonitoredGroups() {
-  try {
-    const rows = await dbAll('SELECT group_id, group_name FROM selected_groups WHERE user_id = ?', [userId]);
-    monitoredGroupIds = new Set(rows.map(r => r.group_id));
-    emit('monitoring', { count: monitoredGroupIds.size });
-    return rows;
-  } catch (err) {
-    emit('error', { message: 'loadMonitoredGroups: ' + err.message });
-    return [];
+  // Prefer Postgres (persistent across redeploys). A successful PG read is
+  // authoritative even when it returns zero rows. Only fall back to SQLite if
+  // the PG read itself fails or PG isn't configured.
+  let rows = null;
+  const pg = getPg();
+  if (pg) {
+    try {
+      rows = await pg.dbAll(
+        `SELECT mg.wa_group_id AS group_id, mg.group_name
+           FROM monitored_groups mg
+           JOIN users u ON u.id = mg.user_id
+          WHERE u.clerk_user_id = $1 AND mg.is_active = true`,
+        [userId]
+      );
+    } catch (err) {
+      process.stderr.write(`[bridge] loadMonitoredGroups: PG read failed (${err.message}); falling back to SQLite\n`);
+      rows = null;
+    }
   }
+  if (rows === null) {
+    try {
+      rows = await dbAll('SELECT group_id, group_name FROM selected_groups WHERE user_id = ?', [userId]);
+    } catch (err) {
+      emit('error', { message: 'loadMonitoredGroups: ' + err.message });
+      return [];
+    }
+  }
+  monitoredGroupIds = new Set(rows.map(r => r.group_id));
+  emit('monitoring', { count: monitoredGroupIds.size });
+  return rows;
 }
 
 function wireMessageListener() {
