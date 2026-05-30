@@ -438,6 +438,10 @@ class WhatsAppService {
           : `Found ${data.totalChats} chats so far…`,
       });
     } else if (type === 'groups') {
+      // Cache so a subsequent getGroups() call (triggered by the groups_detected
+      // SSE event on the client) resolves immediately without a second bridge scan.
+      this._groupsCache = this._groupsCache || new Map();
+      this._groupsCache.set(userId, data.groups);
       this._emit(userId, 'groups_detected', {
         count: data.groups.length,
         totalChats: data.totalChats,
@@ -456,6 +460,7 @@ class WhatsAppService {
     } else if (type === 'disconnected') {
       this._stopTailer(userId);
       this.clients.delete(userId);
+      this._groupsCache?.delete(userId);
       this._emit(userId, 'disconnected', { message: `Disconnected: ${data.reason}` });
     } else if (type === 'error') {
       const raw = String(data.message || 'Unknown error');
@@ -514,6 +519,11 @@ class WhatsAppService {
   async getGroups(userId) {
     const entry = this.clients.get(userId);
     if (!entry) throw new Error('WhatsApp not connected');
+
+    // Return cached result from a recently completed scan immediately.
+    this._groupsCache = this._groupsCache || new Map();
+    const cached = this._groupsCache.get(userId);
+    if (cached) return cached;
 
     this._groupsByUser = this._groupsByUser || new Map();
 

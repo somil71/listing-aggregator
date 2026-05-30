@@ -22,30 +22,56 @@ export default function GroupSelectionModal({ onClose, onSaved }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [syncStatus, setSyncStatus] = useState<string>('Connecting to WhatsApp…');
 
-  // Listen for groups_syncing progress events over a side SSE channel so we
-  // can show live status during the (up to 90s) chat-DB hydration wait.
+  // Listen for groups_syncing/groups_detected events over SSE.
+  // We don't call GET /groups on mount — the bridge can take up to 90s to scan
+  // all chats, so we wait for the 'groups_detected' SSE event which fires when
+  // the scan completes, then call GET /groups (which resolves instantly at that
+  // point because the server-side promise is already settled).
   useEffect(() => {
     let es: EventSource | null = null;
+    let done = false;
     (async () => {
-      // Exchange Clerk JWT for a short-lived nonce — keeps the JWT out of URLs
       const sseUrl = await api.getStreamUrl().catch(() => null);
-      if (!sseUrl) return;
+      if (!sseUrl) {
+        // Fallback: if we can't open SSE, call getGroups directly
+        api.getGroups()
+          .then(res => setGroups(res.data?.groups ?? []))
+          .catch(() => setError('Failed to load groups. Make sure WhatsApp is connected.'))
+          .finally(() => setLoading(false));
+        return;
+      }
       es = new EventSource(sseUrl);
+
       es.addEventListener('groups_syncing', (e: MessageEvent) => {
         try {
           const data = JSON.parse(e.data);
           if (data.message) setSyncStatus(data.message);
         } catch (_) {}
       });
+
+      // Bridge signals scan complete — now fetch the full list
+      es.addEventListener('groups_detected', () => {
+        if (done) return;
+        done = true;
+        es?.close();
+        api.getGroups()
+          .then(res => setGroups(res.data?.groups ?? []))
+          .catch(() => setError('Failed to load groups. Make sure WhatsApp is connected.'))
+          .finally(() => setLoading(false));
+      });
+
+      // If SSE errors (e.g. nonce expired), fall back to direct fetch
+      es.onerror = () => {
+        if (done) return;
+        done = true;
+        es?.close();
+        api.getGroups()
+          .then(res => setGroups(res.data?.groups ?? []))
+          .catch(() => setError('Failed to load groups. Make sure WhatsApp is connected.'))
+          .finally(() => setLoading(false));
+      };
     })();
     return () => { if (es) es.close(); };
-  }, []);
-
-  useEffect(() => {
-    api.getGroups()
-      .then(res => setGroups(res.data?.groups ?? []))
-      .catch(() => setError('Failed to load groups. Make sure WhatsApp is connected.'))
-      .finally(() => setLoading(false));
   }, []);
 
   const toggle = (id: string) => {

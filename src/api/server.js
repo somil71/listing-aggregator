@@ -336,6 +336,8 @@ app.use((req, res, next) => {
   if (req.path === '/health' || req.path === '/api/v1/metrics') return next();
   // SSE responses are intentionally long-lived — don't time them out
   if (req.path.endsWith('/qr-stream')) return next();
+  // Group fetch waits for the bridge's chat-DB hydration (up to 95s) — exclude
+  if (req.path.endsWith('/groups')) return next();
 
   const timer = setTimeout(() => {
     if (res.headersSent) return;
