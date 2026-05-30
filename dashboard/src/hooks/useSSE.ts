@@ -9,7 +9,8 @@ const SSE_EVENTS = [
   'qr_generated', 'authenticated', 'disconnected',
   'error', 'scanning', 'groups_detected', 'groups_saved',
   'groups_syncing',
-  'monitoring_started', 'backfill_progress', 'backfill_complete', 'listing_stored',
+  'monitoring_started', 'backfill_progress', 'backfill_warning', 'backfill_complete',
+  'listing_stored',
 ];
 
 export function useSSE(url: string | null, onAuthError?: () => void) {

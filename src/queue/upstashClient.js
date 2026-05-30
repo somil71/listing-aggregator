@@ -33,20 +33,32 @@ async function dequeue(queueName) {
 // Blocking dequeue — returns the next job within `timeoutSec` seconds or null.
 // Eliminates the busy-polling that rpop+sleep produces: with an empty queue,
 // rpop+sleep makes 12 REST calls/min while brpop makes ~1 call per timeout.
+//
+// Older @upstash/redis releases don't expose .brpop; in that case we fall
+// back to a single rpop and let the caller's sleep loop handle pacing.
 async function dequeueBlocking(queueName, timeoutSec = 5) {
   if (!client) return null;
+  // Polling fallback for SDKs that don't expose BRPOP — sleep timeoutSec
+  // on empty queue so we don't burn API calls.
+  const pollFallback = async () => {
+    const job = await dequeue(queueName);
+    if (job) return job;
+    await new Promise(r => setTimeout(r, timeoutSec * 1000));
+    return null;
+  };
+
+  if (typeof client.brpop !== 'function') return pollFallback();
+
   try {
     const res = await client.brpop(queueName, timeoutSec);
-    // brpop returns [key, value] or null on timeout
     if (!res) return null;
     const raw = Array.isArray(res) ? res[1] : res?.[queueName];
     if (raw === null || raw === undefined) return null;
     if (typeof raw === 'object') return raw;
     try { return JSON.parse(raw); } catch { return raw; }
   } catch (err) {
-    // Some Upstash deployments don't allow blocking ops — fall back to rpop
-    if (/not supported|blocking/i.test(err.message)) {
-      return dequeue(queueName);
+    if (/not supported|blocking|not a function/i.test(err.message)) {
+      return pollFallback();
     }
     throw err;
   }
