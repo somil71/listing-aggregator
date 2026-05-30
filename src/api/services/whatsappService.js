@@ -470,7 +470,7 @@ class WhatsAppService {
       this._stopTailer(userId);
       this.clients.delete(userId);
       this._groupsCache?.delete(userId);
-      this._emit(userId, 'disconnected', { message: `Disconnected: ${data.reason}` });
+      this._emit(userId, 'disconnected', { reason: data.reason, message: `Disconnected: ${data.reason}` });
     } else if (type === 'error') {
       const raw = String(data.message || 'Unknown error');
       console.error(`[whatsapp] bridge error for ${userId}:`, raw);

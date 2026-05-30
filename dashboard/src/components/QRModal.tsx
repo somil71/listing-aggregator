@@ -142,7 +142,12 @@ export default function QRModal({ onClose, onConnected }: Props) {
       // Only treat as fatal if we're not already in a terminal phase.
       if (!isTerminal) {
         setPhase('error');
-        setErrorMsg('Connection to WhatsApp was lost. Please reconnect.');
+        const reason = (data as any).reason;
+        setErrorMsg(
+          reason === 'qr_timeout'
+            ? 'The QR code expired before it was scanned. Tap Try Again to get a fresh code.'
+            : 'Connection to WhatsApp was lost. Please reconnect.'
+        );
       }
     } else if (type === 'error') {
       if (!isTerminal) {

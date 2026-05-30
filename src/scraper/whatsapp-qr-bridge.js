@@ -378,6 +378,10 @@ wppconnect
     useChrome: true,
     debug: false,
     logQR: false, // we capture QR ourselves
+    // Keep the QR scannable for 5 min instead of wppconnect's ~60s default.
+    // The default fires 'autocloseCalled' and kills the session before a user
+    // can realistically open WhatsApp → Linked Devices → scan.
+    autoClose: 300000,
     browserPathExecutable: chromeExec || undefined,
     browserArgs: [
       '--no-sandbox',
@@ -403,7 +407,11 @@ wppconnect
         statusSession === 'desconnectedMobile' ||
         statusSession === 'autocloseCalled'
       ) {
-        emit('disconnected', { reason: statusSession });
+        // 'autocloseCalled' = the QR expired unscanned (wppconnect gave up),
+        // which is NOT the same as losing an established connection. Normalize
+        // it so the UI can show "QR expired" rather than "connection lost".
+        const reason = statusSession === 'autocloseCalled' ? 'qr_timeout' : statusSession;
+        emit('disconnected', { reason });
         if (activeClient) activeClient.close().catch(() => {});
         setTimeout(() => process.exit(0), 200);
       }
