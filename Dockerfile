@@ -10,6 +10,7 @@ COPY dashboard/ ./
 # key is a PUBLIC client key (pk_test_/pk_live_) and must be present here, or
 # ClerkProvider boots with publishableKey=undefined and sign-in silently dies.
 # Railway exposes service variables as build args — declare the ARG to receive it.
+# Build cache invalidation: 2026-05-30T13:25:00Z
 ARG VITE_CLERK_PUBLISHABLE_KEY
 ENV VITE_CLERK_PUBLISHABLE_KEY=$VITE_CLERK_PUBLISHABLE_KEY
 
