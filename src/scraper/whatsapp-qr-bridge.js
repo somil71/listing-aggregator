@@ -517,13 +517,21 @@ async function dispatchCmd(cmd) {
       // hydrates over the next 5–30 seconds as the WA Web client syncs.
       // Poll until we see chats, then return the groups.  Up to 90s total.
       (async () => {
+        // Per-call timeout: wppconnect's getAllChats() can hang indefinitely when
+        // WA Web is still hydrating its internal chat store. Without a timeout the
+        // whole polling loop stalls on a single await, defeating the MAX_MS guard.
+        const withTimeout = (promise, ms) => Promise.race([
+          promise,
+          new Promise((_, rej) => setTimeout(() => rej(new Error('fetchChats timeout')), ms)),
+        ]);
+
         const fetchChats = async () => {
-          // Try wppconnect APIs in order of preference
+          // Try wppconnect APIs in order of preference, each capped at 15s
           if (typeof activeClient.getAllChats === 'function') {
-            try { return await activeClient.getAllChats(); } catch (_) {}
+            try { return await withTimeout(activeClient.getAllChats(), 15_000); } catch (_) {}
           }
           if (typeof activeClient.listChats === 'function') {
-            try { return await activeClient.listChats(); } catch (_) {}
+            try { return await withTimeout(activeClient.listChats(), 15_000); } catch (_) {}
           }
           return [];
         };
@@ -574,10 +582,10 @@ async function dispatchCmd(cmd) {
             emit('groups', { groups, totalChats: raw.length, attempts });
             return;
           }
-          // poll every 2s while syncing
+          // poll every 2s while syncing (each fetchChats is already capped at 15s)
           await new Promise(r => setTimeout(r, 2000));
         }
-        // Timed out — return whatever we have (likely empty)
+        // Timed out — return whatever we have
         const finalRaw = await fetchChats();
         emit('groups', {
           groups: filterGroups(finalRaw),
