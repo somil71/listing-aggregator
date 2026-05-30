@@ -1,41 +1,19 @@
 require('dotenv').config();
 const crypto = require('crypto');
-// In @clerk/backend v3, verifyToken is a top-level export — NOT a method on
-// the object returned by createClerkClient().  createClerkClient() is still
-// used for the management API (users, sessions, etc.).
-const { createClerkClient, verifyToken } = require('@clerk/backend');
+const { createRemoteJWKSet, jwtVerify } = require('jose');
 
-const clerk = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
-
-// Clerk v3 enforces authorizedParties when the JWT contains an `azp` claim.
-// The frontend stamps azp = the page's origin, so whitelist every origin that
-// legitimately loads the app.  Override via CLERK_AUTHORIZED_PARTIES (comma-
-// separated) in production.
-const _rawParties = process.env.CLERK_AUTHORIZED_PARTIES || '';
-const authorizedParties = _rawParties
-  ? _rawParties.split(',').map(s => s.trim()).filter(Boolean)
-  : [
-      'http://localhost:3000',   // Express server (production build)
-      'http://localhost:5173',   // Vite dev server
-      'http://localhost:4173',   // Vite preview
-      'http://127.0.0.1:3000',
-      'http://127.0.0.1:5173',
-    ];
-
-// Use secretKey so Clerk fetches the current JWKS dynamically.
-// This is more robust than embedding a static RSA key that can become stale
-// when Clerk rotates their signing keys. CLERK_SECRET_KEY is in Railway Variables.
-// authorizedParties is omitted — RSA signature is sufficient proof of legitimacy.
-const _verifyOpts = {
-  secretKey: process.env.CLERK_SECRET_KEY,
-};
+// Clerk's public JWKS endpoint — no secret key required, always returns current keys.
+// Decoded from publishable key: pk_test_Z2xhZC1qYXktMzEuY2xlcmsuYWNjb3VudHMuZGV2JA → glad-jay-31.clerk.accounts.dev
+const JWKS = createRemoteJWKSet(
+  new URL('https://glad-jay-31.clerk.accounts.dev/.well-known/jwks.json')
+);
 
 // ── Standard middleware — reads Clerk JWT from Authorization header ────────────
 const authenticate = async (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ success: false, error: 'Unauthorized' });
   try {
-    const payload = await verifyToken(token, _verifyOpts);
+    const { payload } = await jwtVerify(token, JWKS);
     req.userId = payload.sub;
     next();
   } catch (err) {
@@ -60,9 +38,6 @@ const authenticate = async (req, res, next) => {
 //     server instances race.
 //   - Fallback: in-process Map when Redis isn't configured (single-instance
 //     deployments). The Map is bounded by its own setInterval cleanup.
-//
-// In multi-instance (Docker --scale, K8s replicas) the Redis path is required:
-// a nonce created by instance A must be validated by instance B.
 let cacheService = null;
 try { cacheService = require('../services/cacheService'); } catch { cacheService = null; }
 
@@ -83,7 +58,6 @@ async function createSSENonce(userId) {
   const key = `sse-nonce:${nonce}`;
 
   if (cacheService && cacheService._redisReady) {
-    // Redis: 60s expiry guarantees automatic cleanup
     await cacheService._redis.set(key, userId, 'EX', NONCE_TTL_SEC);
   } else {
     _sseNoncesMem.set(nonce, { userId, expiresAt: Date.now() + NONCE_TTL_SEC * 1000 });
@@ -102,8 +76,6 @@ const authenticateSSE = async (req, res, next) => {
   let userId = null;
   if (cacheService && cacheService._redisReady) {
     try {
-      // GETDEL is atomic — read-and-consume in one round trip.  Falls back to
-      // GET+DEL for older Redis versions that don't support GETDEL.
       userId = await cacheService._redis.call('GETDEL', key).catch(async () => {
         const v = await cacheService._redis.get(key);
         if (v) await cacheService._redis.del(key);
@@ -130,5 +102,9 @@ const authenticateSSE = async (req, res, next) => {
   req.userId = userId;
   next();
 };
+
+// clerk client kept for any management API calls elsewhere in the codebase
+const { createClerkClient } = require('@clerk/backend');
+const clerk = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
 
 module.exports = { clerk, authenticate, authenticateSSE, createSSENonce };
