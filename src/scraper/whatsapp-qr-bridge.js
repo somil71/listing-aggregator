@@ -382,6 +382,12 @@ wppconnect
     // The default fires 'autocloseCalled' and kills the session before a user
     // can realistically open WhatsApp → Linked Devices → scan.
     autoClose: 300000,
+    // Raise the per-CDP-call ceiling from puppeteer's default. Backfill's
+    // openChat()/getAllMessagesInChat() on a busy group runs a heavy
+    // Runtime.callFunctionOn that was exceeding the default and rejecting with
+    // "Runtime.callFunctionOn timed out" (deploy f350d2b9 backfill_warning).
+    // This only bounds a single call — it does NOT delay normal operation.
+    puppeteerOptions: { protocolTimeout: 120_000 },
     browserPathExecutable: chromeExec || undefined,
     browserArgs: [
       '--no-sandbox',
