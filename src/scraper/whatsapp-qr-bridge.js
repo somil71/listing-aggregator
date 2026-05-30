@@ -51,6 +51,13 @@ function emit(type, data = {}) {
   process.stderr.write(`[bridge] ${type}\n`);
 }
 
+// Boot timestamp — any command whose ts predates this was queued for a
+// previous incarnation of the bridge (e.g. a stale 'disconnect' from the
+// dashboard's reconnect flow) and must be ignored, or it would kill us.
+// A small skew allowance covers clock jitter between server and bridge.
+const BOOT_TS = Date.now();
+const CMD_STALE_SKEW_MS = 2000;
+
 emit('boot', { authDir, chromeExec: chromeExec || '(default)' });
 
 let activeClient = null;
@@ -232,17 +239,64 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
   // is "opened" (clicked) in the UI.  Without this, loadEarlierMessages is a
   // no-op.  We open the chat and wait briefly for the initial load.
   if (list('openChat')) {
-    try {
-      await activeClient.openChat(groupId);
-      await new Promise(r => setTimeout(r, 1500));
-      // Mark as seen to make WA think we're actively viewing the chat
-      if (list('sendSeen')) {
-        try { await activeClient.sendSeen(groupId); } catch (_) {}
+    // openChat occasionally rejects with a transient Puppeteer error
+    // ("Protocol error (Runtime.callFunctionOn): Promise was collected")
+    // when WhatsApp Web's page context is GC'd mid-call — especially right
+    // after a (re)link while the store is still settling. This is NOT a
+    // permanent "user left the group" failure, so retry a few times before
+    // giving up. Without the retry, an active group can be skipped on every
+    // pass and its newest messages never get harvested.
+    let opened = false;
+    let lastErr = null;
+    for (let attempt = 1; attempt <= 4 && !opened; attempt++) {
+      try {
+        await activeClient.openChat(groupId);
+        await new Promise(r => setTimeout(r, 2500));
+        // Mark as seen to make WA think we're actively viewing the chat
+        if (list('sendSeen')) {
+          try { await activeClient.sendSeen(groupId); } catch (_) {}
+        }
+        opened = true;
+        emit('backfill_chat_opened', { groupId, groupName, attempt });
+      } catch (e) {
+        lastErr = e;
+        emit('backfill_warning', {
+          groupId, groupName, reason: 'open_retry',
+          message: `attempt ${attempt}: ${e.message}`,
+        });
+        // Back off a bit before retrying so the page context can recover.
+        await new Promise(r => setTimeout(r, 2000));
       }
-      emit('backfill_chat_opened', { groupName });
-    } catch (e) {
-      emit('error', { message: `openChat ${groupName}: ${e.message}` });
     }
+    if (!opened) {
+      // Exhausted retries. Skip this group's backfill but DO NOT emit 'error'
+      // — that would tear the whole modal into a fatal state. Live messages
+      // for other groups still flow normally.
+      emit('backfill_warning', {
+        groupId, groupName, reason: 'open_failed',
+        message: lastErr ? lastErr.message : 'unknown',
+      });
+      return 0;  // can't open the chat at all, nothing to backfill
+    }
+  }
+
+  // Step 0b: wait for WhatsApp Web to finish streaming the chat's RECENT
+  // history before we harvest.  This is the fix for "messages sent while the
+  // bridge was offline never show up after reconnect": on a freshly (re)linked
+  // device the phone pushes the backlog over several seconds, so harvesting the
+  // instant the chat opens grabs a shallow, stale snapshot (we observed exactly
+  // 15 old messages — none of the gap). Poll the loaded-message count and wait
+  // until it stops growing for a few rounds, capped at a ~30s budget. Unlike
+  // Step 1 (which scrolls UP for OLD history), this lets the NEWEST messages
+  // land first.
+  if (list('getAllMessagesInChat')) {
+    let prev = -1, stable = 0;
+    for (let i = 0; i < 30 && stable < 4; i++) {
+      const peek = await activeClient.getAllMessagesInChat(groupId, true, false).catch(() => []);
+      if (peek.length === prev) stable++; else { stable = 0; prev = peek.length; }
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    emit('backfill_synced', { groupId, groupName, loaded: prev });
   }
 
   // Step 1: scroll back through the chat repeatedly to force WA Web to
@@ -275,7 +329,9 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
       emit('backfill_scrolled', { groupName, attempts: 50, finalCount: lastCount });
     }
   } catch (e) {
-    emit('error', { message: `scroll-load ${groupName}: ${e.message}` });
+    // scroll-load failure is also non-fatal — we still try to harvest
+    // whatever's already loaded below.
+    emit('backfill_warning', { groupName, reason: 'scroll_failed', message: e.message });
   }
 
   // Step 2: harvest everything that's now loaded
@@ -284,7 +340,7 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
       messages = await activeClient.getAllMessagesInChat(groupId, true, false);
       emit('backfill_loaded', { groupName, method: 'getAllMessagesInChat', count: messages.length });
     } catch (e) {
-      emit('error', { message: `getAllMessagesInChat: ${e.message}` });
+      emit('backfill_warning', { groupName, reason: 'harvest_failed', message: e.message });
     }
   }
 
@@ -293,7 +349,7 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
       messages = await activeClient.loadAndGetAllMessagesInChat(groupId, true, false);
       emit('backfill_loaded', { groupName, method: 'loadAndGetAllMessagesInChat', count: messages.length });
     } catch (e) {
-      emit('error', { message: `loadAndGetAllMessagesInChat: ${e.message}` });
+      emit('backfill_warning', { groupName, reason: 'harvest_failed', message: e.message });
     }
   }
 
@@ -381,6 +437,13 @@ wppconnect
 // different node can still control this bridge (multi-instance deployments).
 let _seenCmdSig = new Map();   // dedupe Redis + file delivery within 2s
 async function handleCmd(cmd) {
+  // Ignore commands queued before this bridge booted — they were meant for a
+  // previous incarnation. Without this, a 'disconnect' sent during the
+  // dashboard's reconnect flow is picked up by the fresh bridge and kills it.
+  if (cmd && typeof cmd.ts === 'number' && cmd.ts < BOOT_TS - CMD_STALE_SKEW_MS) {
+    process.stderr.write(`[bridge] ignoring stale cmd '${cmd.cmd}' (ts ${cmd.ts} < boot ${BOOT_TS})\n`);
+    return;
+  }
   const sig = cmd?.cmd + '|' + (cmd?.ts || '');
   const now = Date.now();
   // Purge expired dedupe entries

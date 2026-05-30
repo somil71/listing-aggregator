@@ -14,8 +14,15 @@ rule_files:
   - 'alerts.yml'
 
 scrape_configs:
-  # Property Digest API (unauthenticated — internal scrape only)
+  # Property Digest API — metrics are token-gated (METRICS_TOKEN in the app's
+  # env). Prometheus sends that same token as a Bearer credential read from a
+  # mounted secret file, so the scrape authenticates instead of getting 401/404.
+  # Provision the file (e.g. a k8s Secret or docker secret) with the exact value
+  # of METRICS_TOKEN; if METRICS_TOKEN is unset the endpoint is disabled (404).
   - job_name: 'property-digest'
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/metrics_token
     static_configs:
       - targets: ['app:3000']
     metrics_path: '/api/v1/metrics'

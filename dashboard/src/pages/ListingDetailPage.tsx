@@ -3,7 +3,8 @@ import { useParams, Link } from 'react-router-dom';
 import axios from 'axios';
 import { useAuth } from '@clerk/react';
 import {
-  ArrowLeft, MapPin, Bed, Ruler, Phone, MessageCircle, User, Sparkles, Loader2, Tag,
+  ArrowLeft, MapPin, Phone, MessageCircle, User, Sparkles, Loader2,
+  CheckCircle2, Image as ImageIcon, FileText, Calendar, Tag, X, Flag,
 } from 'lucide-react';
 import AuthenticatedMedia from '../components/AuthenticatedMedia';
 import Layout from '../components/Layout';
@@ -44,8 +45,7 @@ interface ListingDetail {
   sender_name: string | null;
 }
 
-// Phone helpers imported from utils/phone — single source of truth.
-
+// ─── Formatters ──────────────────────────────────────────────────────────────
 const fmt = (price: number | string | null, currency?: string | null): string => {
   const p = price === null || price === undefined ? NaN : parseFloat(String(price));
   if (!p || isNaN(p)) return '—';
@@ -74,28 +74,36 @@ const fmtBeds = (bedrooms: number | string | null, unit_type: string | null): st
   return `${n % 1 === 0 ? n : n.toFixed(1)} ${unit_type ? unit_type.toUpperCase() : 'BR'}`;
 };
 
+// Tone for the intent badge — same look across light + dark themes
 const intentBadge = (intent: string | null) => {
   switch ((intent || '').toLowerCase()) {
-    case 'rent':     return { label: 'RENT',     cls: 'bg-blue-100 text-blue-700' };
-    case 'sale':     return { label: 'SALE',     cls: 'bg-purple-100 text-purple-700' };
-    case 'wanted':   return { label: 'WANTED',   cls: 'bg-amber-100 text-amber-700' };
-    case 'roommate': return { label: 'ROOMMATE', cls: 'bg-pink-100 text-pink-700' };
-    default:         return { label: 'LISTING',  cls: 'bg-slate-100 text-slate-500' };
+    case 'rent':     return { label: 'For Rent',   cls: 'bg-blue-500/15 text-blue-600 dark:bg-blue-400/15 dark:text-blue-300 ring-1 ring-blue-500/20' };
+    case 'sale':     return { label: 'For Sale',   cls: 'bg-purple-500/15 text-purple-600 dark:bg-purple-400/15 dark:text-purple-300 ring-1 ring-purple-500/20' };
+    case 'wanted':   return { label: 'Wanted',     cls: 'bg-amber-500/15 text-amber-600 dark:bg-amber-400/15 dark:text-amber-300 ring-1 ring-amber-500/20' };
+    case 'roommate': return { label: 'Roommate',   cls: 'bg-pink-500/15 text-pink-600 dark:bg-pink-400/15 dark:text-pink-300 ring-1 ring-pink-500/20' };
+    default:         return { label: 'Listing',    cls: 'bg-slate-500/15 text-slate-600 dark:bg-slate-400/15 dark:text-slate-300 ring-1 ring-slate-500/20' };
   }
 };
 
 const furnishedLabel = (f: string | null): string => {
   if (!f) return '—';
-  return { furnished: '✓ Furnished', 'semi-furnished': '◑ Semi-furnished', unfurnished: '✗ Unfurnished' }[f] ?? f;
+  return ({ furnished: 'Fully furnished', 'semi-furnished': 'Semi-furnished', unfurnished: 'Unfurnished' } as Record<string, string>)[f] ?? f;
 };
 
 // ─── Detail cell ─────────────────────────────────────────────────────────────
-function DetailCell({ label, value }: { label: string; value: React.ReactNode }) {
+function DetailCell({ label, value, icon: Icon }: {
+  label: string;
+  value: React.ReactNode;
+  icon?: React.ComponentType<{ className?: string }>;
+}) {
   if (!value || value === '—') return null;
   return (
-    <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100">
-      <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">{label}</div>
-      <div className="font-black text-slate-900 text-base">{value}</div>
+    <div className="bg-slate-50 dark:bg-slate-800/60 p-4 rounded-2xl border border-slate-200/60 dark:border-slate-700/60">
+      <div className="flex items-center gap-1.5 mb-1.5">
+        {Icon && <Icon className="w-3 h-3 text-slate-400 dark:text-slate-500" />}
+        <div className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">{label}</div>
+      </div>
+      <div className="font-black text-slate-900 dark:text-white text-base">{value}</div>
     </div>
   );
 }
@@ -110,10 +118,27 @@ export default function ListingDetailPage() {
   const [summary, setSummary] = useState<string>('');
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [lightbox, setLightbox] = useState<string | null>(null);
+  const [flagState, setFlagState] = useState<'idle' | 'sending' | 'done'>('idle');
 
   const authHeaders = async () => {
     const token = await getToken();
     return { Authorization: `Bearer ${token}` };
+  };
+
+  // "Report wrong" — the human detection channel. Tells the backend this
+  // extraction is bad: it's counted (health.js shows the flag rate) and the
+  // listing is immediately hidden so the bad data stops showing.
+  const handleFlag = async () => {
+    if (flagState !== 'idle') return;
+    setFlagState('sending');
+    try {
+      const headers = await authHeaders();
+      await axios.post(`/api/listings/${id}/flag`, {}, { headers });
+      setFlagState('done');
+    } catch (err) {
+      console.error(err);
+      setFlagState('idle');
+    }
   };
 
   useEffect(() => {
@@ -148,26 +173,35 @@ export default function ListingDetailPage() {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-50">
-        <Loader2 className="w-8 h-8 animate-spin text-blue-600" />
-      </div>
+      <Layout>
+        <div className="min-h-screen flex items-center justify-center">
+          <Loader2 className="w-8 h-8 animate-spin text-blue-600 dark:text-blue-400" />
+        </div>
+      </Layout>
     );
   }
 
   if (!listing) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-50 flex-col gap-4">
-        <p className="font-black text-slate-400 uppercase tracking-widest">Listing not found</p>
-        <Link to="/dashboard" className="text-blue-600 font-bold text-sm underline">← Back to Dashboard</Link>
-      </div>
+      <Layout>
+        <div className="min-h-screen flex items-center justify-center flex-col gap-4">
+          <p className="font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">Listing not found</p>
+          <Link to="/dashboard" className="text-blue-600 dark:text-blue-400 font-bold text-sm underline">← Back to Dashboard</Link>
+        </div>
+      </Layout>
     );
   }
 
+  // ─── Derived values (logic preserved verbatim from previous version) ────
   const badge       = intentBadge(listing.intent);
   const conf        = parseFloat(String(listing.confidence ?? 0));
-  const confCls     = conf >= 0.7 ? 'bg-green-100 text-green-700' : conf >= 0.3 ? 'bg-amber-100 text-amber-700' : 'bg-slate-100 text-slate-500';
+  const confCls     = conf >= 0.7
+    ? 'bg-emerald-500/15 text-emerald-600 dark:bg-emerald-400/15 dark:text-emerald-300 ring-1 ring-emerald-500/20'
+    : conf >= 0.3
+    ? 'bg-amber-500/15 text-amber-600 dark:bg-amber-400/15 dark:text-amber-300 ring-1 ring-amber-500/20'
+    : 'bg-slate-500/15 text-slate-500 dark:bg-slate-400/15 dark:text-slate-400 ring-1 ring-slate-500/20';
+
   // Fallback: if the LLM missed the location, infer from description/raw_message.
-  // Stop-token approach works on both multiline and whitespace-collapsed text.
   const guessLocationFromText = (text: string | null): string | null => {
     if (!text) return null;
     const stopRe = /\b(?:independent|semi[\s-]?furnished|furnished|unfurnished|available|vacant|for\s+(?:rent|sale)|rent|sale|lease|only|\d+\s*(?:bhk|rk|bk|br|bedroom|bath|sqft|sqm)|flats?|studio|apartment|house|room|pg\b|bachelor|single|double|triple|looking|wanted)\b/i;
@@ -176,7 +210,6 @@ export default function ListingDetailPage() {
       const before = text.slice(0, m.index).trim().replace(/[^\w\s]/g, '').trim();
       if (before.length >= 2 && before.length <= 50 && /[a-zA-Z]/.test(before)) return before;
     }
-    // Multiline fallback
     const lines = text.split(/\n/).map((l: string) => l.trim()).filter(Boolean);
     if (lines.length > 1) {
       const skipRe = /\b(?:furnished|unfurnished|owner|story|storey|available|vacant|rent|sale|lease|flats?|studio|apartments?|house|room|pg\b|bachelor|looking|wanted|independent|semi)\b/i;
@@ -188,7 +221,6 @@ export default function ListingDetailPage() {
     }
     return null;
   };
-  // Reject DB values that are property attributes, not locations ("Fully Furnished", "With Owner", etc.)
   const isLikelyLocation = (str: string | null): boolean => {
     if (!str) return false;
     const nonLocRe = /\b(?:furnished|unfurnished|owner|story|storey|available|vacant|with\s+owner)\b/i;
@@ -197,86 +229,125 @@ export default function ListingDetailPage() {
   const dbLoc = (listing.community && isLikelyLocation(listing.community)) ? listing.community
     : (listing.area_text && isLikelyLocation(listing.area_text)) ? listing.area_text : null;
   const location = dbLoc || guessLocationFromText(listing.raw_message || listing.description) || null;
+
   const contactPhone = sanitizePhone(listing.agent_phone) || sanitizePhone(listing.sender_wa_id);
   const displayName  = toDisplayName(listing.agent_name) || toDisplayName(listing.sender_name);
   const hasContact   = !!contactPhone;
   const mediaKeys    = (listing.media_keys || []).filter(Boolean);
+  const formattedPrice = fmt(listing.price, listing.currency);
 
   return (
     <Layout>
-      <main className="flex-1 p-8 bg-slate-50 dark:bg-slate-950">
-        <div className="max-w-4xl mx-auto space-y-6">
+      <main className="flex-1 px-4 sm:px-6 lg:px-8 py-6 bg-slate-50 dark:bg-slate-950">
+        <div className="max-w-5xl mx-auto space-y-5">
 
-          {/* Back + breadcrumb */}
+          {/* Back link */}
           <Link
             to="/dashboard"
-            className="inline-flex items-center gap-2 text-xs font-black text-slate-400 uppercase tracking-widest hover:text-blue-600 transition-colors"
+            className="inline-flex items-center gap-2 text-xs font-black text-slate-500 dark:text-slate-400 uppercase tracking-widest hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
           >
             <ArrowLeft className="w-3.5 h-3.5" /> Back to Dashboard
           </Link>
 
-          {/* Hero card */}
-          <div className="bg-white dark:bg-slate-900 rounded-[40px] p-8 shadow-sm border border-slate-200 dark:border-slate-800">
-            <div className="flex items-start justify-between gap-4 flex-wrap">
-              <div className="flex-1 min-w-0">
-                {/* Badges */}
-                <div className="flex items-center gap-2 flex-wrap mb-3">
-                  <span className={`text-[10px] font-black uppercase px-2 py-0.5 rounded ${badge.cls}`}>{badge.label}</span>
-                  <span className={`text-[10px] font-black uppercase px-2 py-0.5 rounded ${confCls}`}>
+          {/* ── Hero card ───────────────────────────────────────────────────── */}
+          <div className="bg-white dark:bg-slate-900 rounded-3xl shadow-sm border border-slate-200/70 dark:border-slate-800 overflow-hidden">
+            <div className="p-6 sm:p-8 grid grid-cols-1 lg:grid-cols-[1fr,260px] gap-6">
+
+              {/* Left: badges + price + location */}
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 flex-wrap mb-4">
+                  <span className={`text-[10px] font-black uppercase tracking-widest px-2.5 py-1 rounded-full ${badge.cls}`}>
+                    {badge.label}
+                  </span>
+                  <span className={`text-[10px] font-black uppercase tracking-widest px-2.5 py-1 rounded-full ${confCls}`}>
                     {Math.round(conf * 100)}% confidence
                   </span>
                   {listing.vacant === true && (
-                    <span className="text-[10px] font-black uppercase px-2 py-0.5 rounded bg-green-100 text-green-700">VACANT</span>
+                    <span className="text-[10px] font-black uppercase tracking-widest px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-600 dark:bg-emerald-400/15 dark:text-emerald-300 ring-1 ring-emerald-500/20 inline-flex items-center gap-1">
+                      <CheckCircle2 className="w-3 h-3" /> Vacant
+                    </span>
                   )}
                   {listing.property_type && (
-                    <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded bg-slate-100 text-slate-500 capitalize">
+                    <span className="text-[10px] font-bold uppercase tracking-widest px-2.5 py-1 rounded-full bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300 capitalize">
                       {listing.property_type}
                     </span>
                   )}
+                  <button
+                    onClick={handleFlag}
+                    disabled={flagState !== 'idle'}
+                    title="Report this listing's details as wrong"
+                    className={`ml-auto text-[10px] font-black uppercase tracking-widest px-2.5 py-1 rounded-full inline-flex items-center gap-1 transition-colors ${
+                      flagState === 'done'
+                        ? 'bg-amber-500/15 text-amber-600 dark:bg-amber-400/15 dark:text-amber-300 cursor-default'
+                        : 'bg-slate-100 text-slate-500 hover:bg-rose-500/15 hover:text-rose-600 dark:bg-slate-800 dark:text-slate-400 dark:hover:bg-rose-400/15 dark:hover:text-rose-300'
+                    }`}
+                  >
+                    <Flag className="w-3 h-3" />
+                    {flagState === 'done' ? 'Reported' : flagState === 'sending' ? '…' : 'Report wrong'}
+                  </button>
                 </div>
 
-                {/* Price */}
-                <div className="text-5xl font-black text-slate-900 tracking-tighter">
-                  {fmt(listing.price, listing.currency)}
+                {/* Price — large, bold, dark-mode safe */}
+                <div className="flex items-baseline gap-2 flex-wrap">
+                  <span className="text-5xl sm:text-6xl font-black tracking-tighter text-slate-900 dark:text-white">
+                    {formattedPrice}
+                  </span>
                   {listing.rent_period && (
-                    <span className="text-lg text-slate-400 font-bold ml-2">/ {listing.rent_period}</span>
+                    <span className="text-lg sm:text-xl text-slate-400 dark:text-slate-500 font-bold">
+                      / {listing.rent_period}
+                    </span>
                   )}
                 </div>
 
                 {/* Location */}
                 {location && (
-                  <div className="flex items-center gap-2 mt-2">
-                    <MapPin className="w-4 h-4 text-blue-500 shrink-0" />
-                    <span className="font-black text-slate-700 uppercase tracking-tight text-lg">{location}</span>
+                  <div className="flex items-center gap-2 mt-4">
+                    <MapPin className="w-5 h-5 text-blue-500 dark:text-blue-400 shrink-0" />
+                    <span className="font-black text-slate-800 dark:text-slate-100 tracking-tight text-xl">{location}</span>
                   </div>
                 )}
 
-                {/* Group */}
-                <div className="mt-2 text-xs text-slate-400 font-bold uppercase tracking-widest">
-                  From: {listing.group_name}
-                  {listing.ts_listed && ` · ${new Date(listing.ts_listed).toLocaleDateString()}`}
+                {/* Group + date */}
+                <div className="mt-3 flex items-center gap-3 flex-wrap text-xs text-slate-500 dark:text-slate-400 font-bold">
+                  <span className="inline-flex items-center gap-1.5">
+                    <MessageCircle className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                    <span className="truncate max-w-[280px]">{listing.group_name}</span>
+                  </span>
+                  {listing.ts_listed && (
+                    <span className="inline-flex items-center gap-1.5">
+                      <Calendar className="w-3.5 h-3.5" />
+                      {new Date(listing.ts_listed).toLocaleDateString()}
+                    </span>
+                  )}
                 </div>
               </div>
 
-              {/* Contact block */}
-              {(displayName || hasContact) && (
-                <div className="bg-slate-50 rounded-3xl p-4 min-w-[180px] border border-slate-100">
-                  <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Contact</div>
+              {/* Right: contact card */}
+              {(displayName || hasContact) ? (
+                <aside className="bg-slate-50 dark:bg-slate-800/50 rounded-2xl p-5 border border-slate-200/60 dark:border-slate-700/60 self-start">
+                  <div className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-3">Contact</div>
                   {displayName && (
-                    <div className="flex items-center gap-1.5 mb-1">
-                      <User className="w-3.5 h-3.5 text-slate-400" />
-                      <span className="text-sm font-bold text-slate-900">{displayName}</span>
+                    <div className="flex items-center gap-2 mb-1.5">
+                      <div className="w-8 h-8 rounded-full bg-blue-500/15 dark:bg-blue-400/15 flex items-center justify-center shrink-0">
+                        <User className="w-4 h-4 text-blue-600 dark:text-blue-400" />
+                      </div>
+                      <span className="text-sm font-black text-slate-900 dark:text-white truncate">{displayName}</span>
                     </div>
                   )}
                   {contactPhone && (
-                    <div className="text-sm font-bold text-slate-500 mb-3">{formatPhone(contactPhone)}</div>
+                    <div className="text-xs font-mono font-semibold text-slate-500 dark:text-slate-400 mb-4 ml-10">
+                      {formatPhone(contactPhone)}
+                    </div>
                   )}
                   <div className="flex gap-2">
                     <a
                       href={hasContact ? `tel:+${contactPhone!.replace(/\D/g, '')}` : undefined}
                       onClick={!hasContact ? e => e.preventDefault() : undefined}
-                      className={`flex-1 py-2 rounded-xl text-xs font-black uppercase text-center flex items-center justify-center gap-1
-                        ${hasContact ? 'bg-slate-900 text-white hover:bg-slate-800' : 'bg-slate-100 text-slate-300 cursor-not-allowed'}`}
+                      className={`flex-1 py-2.5 rounded-xl text-xs font-black uppercase tracking-widest text-center flex items-center justify-center gap-1.5 transition-colors ${
+                        hasContact
+                          ? 'bg-slate-900 dark:bg-white text-white dark:text-slate-900 hover:bg-slate-800 dark:hover:bg-slate-100'
+                          : 'bg-slate-200 dark:bg-slate-700 text-slate-400 dark:text-slate-500 cursor-not-allowed'
+                      }`}
                     >
                       <Phone className="w-3 h-3" /> Call
                     </a>
@@ -285,138 +356,168 @@ export default function ListingDetailPage() {
                       target={hasContact ? '_blank' : undefined}
                       rel="noreferrer"
                       onClick={!hasContact ? e => e.preventDefault() : undefined}
-                      className={`flex-1 py-2 rounded-xl text-xs font-black uppercase text-center flex items-center justify-center gap-1
-                        ${hasContact ? 'bg-green-600 text-white hover:bg-green-700' : 'bg-slate-50 text-slate-300 cursor-not-allowed'}`}
+                      className={`flex-1 py-2.5 rounded-xl text-xs font-black uppercase tracking-widest text-center flex items-center justify-center gap-1.5 transition-colors ${
+                        hasContact
+                          ? 'bg-emerald-600 text-white hover:bg-emerald-700'
+                          : 'bg-slate-200 dark:bg-slate-700 text-slate-400 dark:text-slate-500 cursor-not-allowed'
+                      }`}
                     >
-                      <MessageCircle className="w-3 h-3" /> WA
+                      <MessageCircle className="w-3 h-3" /> WhatsApp
                     </a>
                   </div>
-                </div>
+                </aside>
+              ) : (
+                <aside className="bg-slate-50 dark:bg-slate-800/40 rounded-2xl p-5 border border-dashed border-slate-200 dark:border-slate-700/60 self-start text-center">
+                  <div className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-2">Contact</div>
+                  <p className="text-xs text-slate-400 dark:text-slate-500 font-medium">No contact details extracted from this message.</p>
+                </aside>
               )}
             </div>
           </div>
 
-          {/* AI Summary */}
-          <div className="bg-gradient-to-br from-blue-50 to-slate-50 rounded-3xl p-6 border border-blue-100">
-            <div className="flex items-center gap-2 mb-3">
-              <Sparkles className="w-4 h-4 text-blue-600" />
-              <div className="text-[10px] font-black text-blue-600 uppercase tracking-widest">AI-Generated Summary</div>
-            </div>
-            {summaryLoading ? (
-              <div className="flex items-center gap-2 text-slate-400 text-sm">
-                <Loader2 className="w-4 h-4 animate-spin" />
-                <span>Generating summary…</span>
+          {/* ── AI Summary ──────────────────────────────────────────────────── */}
+          <div className="relative bg-gradient-to-br from-blue-50 to-slate-50 dark:from-blue-950/30 dark:to-slate-900/60 rounded-3xl p-6 border border-blue-200/60 dark:border-blue-500/15 overflow-hidden">
+            <div className="absolute -top-12 -right-12 w-48 h-48 bg-blue-500/10 dark:bg-blue-400/10 rounded-full blur-3xl pointer-events-none" />
+            <div className="relative">
+              <div className="flex items-center gap-2 mb-3">
+                <Sparkles className="w-4 h-4 text-blue-600 dark:text-blue-400" />
+                <div className="text-[10px] font-black text-blue-600 dark:text-blue-400 uppercase tracking-widest">AI-Generated Summary</div>
               </div>
-            ) : summary ? (
-              <p className="text-slate-700 font-medium leading-relaxed">{summary}</p>
-            ) : (
-              <p className="text-slate-400 text-sm italic">No summary available.</p>
-            )}
+              {summaryLoading ? (
+                <div className="flex items-center gap-2 text-slate-400 dark:text-slate-500 text-sm">
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <span>Generating summary…</span>
+                </div>
+              ) : summary ? (
+                <p className="text-slate-700 dark:text-slate-200 font-medium leading-relaxed">{summary}</p>
+              ) : (
+                <p className="text-slate-400 dark:text-slate-500 text-sm italic">No summary available.</p>
+              )}
+            </div>
           </div>
 
-          {/* Media gallery — AuthenticatedMedia fetches each file with the
-              Clerk JWT so the auth-gated /api/media endpoint accepts it.
-              Plain <img src> / <video src> don't carry custom headers → 401. */}
+          {/* ── Media gallery ───────────────────────────────────────────────── */}
           {listing.has_media && mediaKeys.length > 0 && (
-            <div>
-              <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-3">
-                Photos & Videos ({mediaKeys.length})
+            <section>
+              <div className="flex items-center gap-2 mb-3">
+                <ImageIcon className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400" />
+                <div className="text-[10px] font-black text-slate-500 dark:text-slate-400 uppercase tracking-widest">
+                  Photos & Videos ({mediaKeys.length})
+                </div>
               </div>
-              <div className="flex flex-wrap gap-3">
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
                 {mediaKeys.map((key, idx) => {
                   const filename = key.split(/[\\/]/).pop();
                   const src = `/api/media/${filename}`;
                   const isVideo = /\.(mp4|webm|mov|avi|mkv)$/i.test(filename || '');
                   return (
-                    <AuthenticatedMedia
+                    <div
                       key={src}
-                      src={src}
-                      isVideo={isVideo}
-                      alt={`Property photo ${idx + 1}`}
-                      className={isVideo
-                        ? 'rounded-2xl max-h-64 border border-slate-200 bg-black'
-                        : 'rounded-2xl max-h-64 object-cover border border-slate-200 cursor-zoom-in hover:opacity-90 transition-opacity'}
-                      onClick={isVideo ? undefined : setLightbox}
-                    />
+                      className="relative aspect-square overflow-hidden rounded-2xl border border-slate-200/60 dark:border-slate-800 bg-slate-100 dark:bg-slate-900 group"
+                    >
+                      <AuthenticatedMedia
+                        src={src}
+                        isVideo={isVideo}
+                        alt={`Property photo ${idx + 1}`}
+                        className={isVideo
+                          ? 'w-full h-full object-cover bg-black'
+                          : 'w-full h-full object-cover cursor-zoom-in transition-transform group-hover:scale-105'}
+                        onClick={isVideo ? undefined : setLightbox}
+                      />
+                    </div>
                   );
                 })}
               </div>
-            </div>
+            </section>
           )}
 
-          {/* Details grid */}
-          <div>
-            <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-3">Property Details</div>
-            <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+          {/* ── Details grid ────────────────────────────────────────────────── */}
+          <section>
+            <div className="flex items-center gap-2 mb-3">
+              <Tag className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400" />
+              <div className="text-[10px] font-black text-slate-500 dark:text-slate-400 uppercase tracking-widest">Property Details</div>
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
               <DetailCell label="Configuration" value={fmtBeds(listing.bedrooms, listing.unit_type) ?? '—'} />
               <DetailCell label="Furnished"     value={furnishedLabel(listing.furnished)} />
-              <DetailCell label="Area"          value={
+              <DetailCell label="Area" value={
                 listing.area_sqft != null ? `${parseFloat(String(listing.area_sqft)).toLocaleString()} ft²`
                 : listing.area_sqm  != null ? `${parseFloat(String(listing.area_sqm)).toLocaleString()} m²`
                 : null
               } />
               <DetailCell label="Bathrooms"  value={listing.bathrooms != null ? String(listing.bathrooms) : null} />
-              <DetailCell label="Parking"    value={listing.parking != null ? (listing.parking ? '✓ Included' : '✗ No parking') : null} />
-              <DetailCell label="Vacant"     value={listing.vacant != null ? (listing.vacant ? '✓ Available now' : 'Not immediately') : null} />
+              <DetailCell label="Parking"    value={listing.parking != null ? (listing.parking ? 'Included' : 'Not available') : null} />
+              <DetailCell label="Vacancy"    value={listing.vacant != null ? (listing.vacant ? 'Available now' : 'Not immediately') : null} />
             </div>
-          </div>
+          </section>
 
-          {/* Amenities */}
+          {/* ── Amenities ───────────────────────────────────────────────────── */}
           {listing.amenities && listing.amenities.length > 0 && (
-            <div>
-              <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-3">Amenities</div>
+            <section>
+              <div className="text-[10px] font-black text-slate-500 dark:text-slate-400 uppercase tracking-widest mb-3">Amenities</div>
               <div className="flex flex-wrap gap-2">
                 {listing.amenities.map(a => (
-                  <span key={a} className="px-3 py-1.5 bg-blue-50 text-blue-700 rounded-full text-xs font-bold capitalize">
+                  <span
+                    key={a}
+                    className="px-3 py-1.5 bg-blue-500/10 text-blue-700 dark:text-blue-300 rounded-full text-xs font-bold capitalize border border-blue-500/15"
+                  >
                     {a}
                   </span>
                 ))}
               </div>
-            </div>
+            </section>
           )}
 
-          {/* Raw WhatsApp message */}
-          <div className="bg-[#ECE5DD] rounded-3xl p-6">
-            <div className="text-[10px] font-black text-[#6b7280] uppercase tracking-widest mb-3 flex items-center gap-2">
-              <MessageCircle className="w-3.5 h-3.5 text-green-600" /> Original WhatsApp Message
+          {/* ── Raw WhatsApp message ───────────────────────────────────────── */}
+          <section>
+            <div className="flex items-center gap-2 mb-3">
+              <FileText className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400" />
+              <div className="text-[10px] font-black text-slate-500 dark:text-slate-400 uppercase tracking-widest">Original WhatsApp Message</div>
             </div>
-            <div className="bg-white rounded-2xl px-5 py-4 shadow-sm max-w-lg">
-              <p className="text-slate-800 leading-relaxed font-medium whitespace-pre-wrap text-sm">
-                {listing.raw_message || listing.description || '(No message text)'}
-              </p>
-              <div className="mt-2 text-[10px] text-slate-400 font-bold text-right">
-                {listing.group_name}
-                {listing.ts_listed ? ` · ${new Date(listing.ts_listed).toLocaleString()}` : ''}
+            <div className="bg-[#ECE5DD] dark:bg-[#0b1413] rounded-3xl p-5 sm:p-6 relative overflow-hidden">
+              <div className="absolute inset-0 opacity-[0.03] pointer-events-none"
+                   style={{ backgroundImage: 'radial-gradient(circle, #000 1px, transparent 1px)', backgroundSize: '10px 10px' }} />
+              <div className="relative bg-white dark:bg-[#202c33] rounded-2xl px-5 py-4 shadow-sm max-w-lg">
+                <p className="text-slate-800 dark:text-slate-100 leading-relaxed font-medium whitespace-pre-wrap text-sm">
+                  {listing.raw_message || listing.description || '(No message text)'}
+                </p>
+                <div className="mt-2 text-[10px] text-slate-400 dark:text-slate-500 font-bold text-right">
+                  {listing.group_name}
+                  {listing.ts_listed ? ` · ${new Date(listing.ts_listed).toLocaleString()}` : ''}
+                </div>
               </div>
             </div>
-          </div>
+          </section>
 
-          {/* Parser metadata */}
-          <div className="bg-slate-100 rounded-2xl px-5 py-3 flex flex-wrap items-center gap-4 text-xs text-slate-400 font-bold">
-            <span>Extracted by: <span className="text-slate-600">{listing.extracted_by || 'unknown'}</span></span>
-            <span>Confidence: <span className="text-slate-600">{Math.round(conf * 100)}%</span></span>
-            <span>ID: <span className="text-slate-600 font-mono text-[10px]">{listing.id}</span></span>
+          {/* ── Parser metadata ────────────────────────────────────────────── */}
+          <div className="bg-slate-100 dark:bg-slate-900/60 rounded-2xl px-5 py-3 flex flex-wrap items-center gap-4 text-xs text-slate-500 dark:text-slate-400 font-bold border border-slate-200/60 dark:border-slate-800">
+            <span>Extracted by: <span className="text-slate-700 dark:text-slate-200">{listing.extracted_by || 'unknown'}</span></span>
+            <span>Confidence: <span className="text-slate-700 dark:text-slate-200">{Math.round(conf * 100)}%</span></span>
+            <span>ID: <span className="text-slate-700 dark:text-slate-200 font-mono text-[10px]">{listing.id}</span></span>
           </div>
 
         </div>
       </main>
 
-      {/* Lightbox */}
+      {/* ── Lightbox ──────────────────────────────────────────────────────── */}
       {lightbox && (
         <div
-          className="fixed inset-0 bg-black/90 flex items-center justify-center z-50 p-8"
+          className="fixed inset-0 bg-black/90 backdrop-blur-sm flex items-center justify-center z-50 p-4 sm:p-8"
           onClick={() => setLightbox(null)}
         >
           <img
             src={lightbox}
             alt="Full size"
-            className="max-w-full max-h-full rounded-2xl object-contain"
+            className="max-w-full max-h-full rounded-2xl object-contain shadow-2xl"
             onClick={e => e.stopPropagation()}
           />
           <button
-            className="absolute top-6 right-6 w-10 h-10 bg-white/20 rounded-full flex items-center justify-center text-white hover:bg-white/30"
+            className="absolute top-4 sm:top-6 right-4 sm:right-6 w-10 h-10 bg-white/10 hover:bg-white/20 backdrop-blur rounded-full flex items-center justify-center text-white transition-colors"
             onClick={() => setLightbox(null)}
-          >✕</button>
+            aria-label="Close lightbox"
+          >
+            <X className="w-5 h-5" />
+          </button>
         </div>
       )}
     </Layout>

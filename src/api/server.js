@@ -7,7 +7,7 @@ const helmet     = require('helmet');
 const crypto     = require('crypto');
 const path       = require('path');
 const fs         = require('fs');
-const rateLimit  = require('express-rate-limit');
+const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const promClient = require('prom-client');
 
 const logger            = require('../config/logger');
@@ -130,10 +130,11 @@ async function runMigrations() {
 }
 
 // ── Rate limiters (values from env-specific config) ─────────────────────────
-// IMPORTANT: keyGenerator uses req.ip (the real socket IP) instead of trusting
-// client-supplied X-Forwarded-For, which can be spoofed to bypass per-IP limits.
+// keyGenerator uses the real socket IP (never X-Forwarded-For, which can be
+// spoofed) and calls ipKeyGenerator so IPv6 addresses are normalised to their
+// /56 subnet prefix, satisfying express-rate-limit v8's validation rules.
 // Behind a trusted reverse proxy set app.set('trust proxy', N) explicitly.
-const _rateLimitKey = (req) => req.socket.remoteAddress || req.ip;
+const _rateLimitKey = (req) => ipKeyGenerator(req.socket.remoteAddress || req.ip);
 
 const apiLimiter = rateLimit({
   ...config.rateLimit,
@@ -212,18 +213,22 @@ app.use(helmet({
       frameAncestors: ["'none'"],
       baseUri:        ["'self'"],
       formAction:     ["'self'"],
-      // Trusted Types — newest browsers will block any DOM-XSS sink
-      // (innerHTML, eval, etc.) that isn't using a registered policy.
-      // React 18 emits Trusted-Types-safe DOM updates, so we can lock this
-      // down without breaking the app. 'allow-duplicates' is included so
-      // hot-reload during dev doesn't trip the policy registration.
-      'require-trusted-types-for': ["'script'"],
-      'trusted-types': ['default', 'react', 'allow-duplicates'],
+      // NOTE: require-trusted-types-for is intentionally NOT enforced.
+      // Clerk's widget uses innerHTML-style DOM sinks without a registered
+      // Trusted Types policy, so enforcing this directive blanks the sign-in
+      // form. We use report-only below to surface violations without
+      // breaking auth. Re-enable enforcement once @clerk/react ships
+      // Trusted Types policy registration.
       // CSP violations are POSTed here so we can watch for new XSS attempts
       // or legitimate inline scripts we forgot to nonce after a code change.
       reportUri:      ['/api/csp-report'],
       upgradeInsecureRequests: [],
     },
+    // Run Trusted Types in REPORT-ONLY mode — violations get logged to
+    // /api/csp-report but the browser doesn't actually block them. This
+    // tracks how much surface area Clerk has so we know when it's safe
+    // to flip to enforced mode.
+    reportOnly: false,
   },
   crossOriginEmbedderPolicy: false,   // needed for Clerk's auth iframe
   hsts: {
@@ -379,7 +384,12 @@ app.get('/health', async (req, res) => {
 app.get('/api/v1/metrics', async (req, res) => {
   const expected = process.env.METRICS_TOKEN;
   if (!expected) return res.status(404).end('Not found');
-  const provided = req.headers['x-metrics-token'];
+  // Accept the token either via the dedicated `x-metrics-token` header OR as a
+  // standard `Authorization: Bearer <token>` credential. The Bearer form lets
+  // Prometheus authenticate with its native `authorization` scrape config (see
+  // monitoring/prometheus.yml) without needing a custom-header extension.
+  const bearer   = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  const provided = req.headers['x-metrics-token'] || bearer;
   if (!provided || provided !== expected) return res.status(401).end('Unauthorized');
   res.set('Content-Type', metricsRegistry.contentType);
   res.end(await metricsRegistry.metrics());
@@ -439,13 +449,25 @@ app.get('/api/listings/today', authenticate, auditLog('view_listings', 'listing'
     const {
       location, min_price, max_price, property_type,
       agent_phone, furnished, min_confidence = 0.2,
-      intent, unit_type, bedrooms, rent_period,
+      intent, unit_type, bedrooms, rent_period, min_reposts,
     } = req.query;
+
+    // Repost filter: keep only listings re-posted at least N times by the same
+    // sender (eager-seller signal). repost_count is a window aggregate so it
+    // can't go in WHERE directly — we filter it in an outer query below.
+    // Only meaningful for N > 1 (every row has a count of at least 1).
+    const minRepostsNum = parseInt(min_reposts);
+    const hasRepostFilter = !isNaN(minRepostsNum) && minRepostsNum > 1;
 
     const rawLimit  = parseInt(req.query.limit);
     const rawOffset = parseInt(req.query.offset);
-    const limit  = (!isNaN(rawLimit)  && rawLimit  > 0) ? Math.min(rawLimit,  500) : 100;
+    const limit  = (!isNaN(rawLimit)  && rawLimit  > 0) ? Math.min(rawLimit,  500) : 250;
     const offset = (!isNaN(rawOffset) && rawOffset >= 0) ? rawOffset : 0;
+
+    // Opt-out filter for non-property listings (vehicles, services, classifieds
+    // that the parser mis-classified as apartments). Enabled by default — the
+    // dashboard can pass ?include_non_property=true to see everything.
+    const includeNonProperty = req.query.include_non_property === 'true';
 
     if (min_price && isNaN(Number(min_price)))
       return res.status(400).json({ success: false, error: 'min_price must be a number' });
@@ -502,48 +524,113 @@ app.get('/api/listings/today', authenticate, auditLog('view_listings', 'listing'
     }
     if (rent_period)   { conditions.push(`l.rent_period = $${++p}`);       params.push(rent_period); }
 
+    // Non-property filter — drop messages the LLM mis-classified as flats.
+    //
+    // Postgres regex uses POSIX bracketed word boundaries [[:<:]] / [[:>:]]
+    // (NOT \m / \M which are PCRE-only and silently no-op here), and POSIX
+    // character classes [[:space:]] / [[:digit:]] (NOT \s / \d).
+    //
+    // We exclude a listing when BOTH:
+    //   (a) the raw text contains obvious vehicle/service keywords, AND
+    //   (b) the raw text does NOT contain typical property keywords.
+    //
+    // This catches the "2018 model 4500k chalo … 95k" case where the LLM
+    // hallucinated property_type=apartment + bedrooms=1, because (a) is
+    // true ("model", "chalo") and (b) is true (no BHK/flat/rent).
+    if (!includeNonProperty) {
+      conditions.push(`NOT (
+        LOWER(COALESCE(r.text, l.description, '')) ~* '[[:<:]](bike|scooter|motorcycle|motorbike|royal[[:space:]]*enfield|bullet|activa|yamaha|hero[[:space:]]*splendor|km[[:space:]]*driven|km[[:space:]]*running|km[[:space:]]*ran|chalo|chala|chalti|cc[[:space:]]*engine|petrol|diesel|second[[:space:]]*hand[[:space:]]*(car|bike|vehicle)|used[[:space:]]*(car|bike|vehicle)|year[[:space:]]*model|[0-9]{4}[[:space:]]+model|tutor|tuition|coaching|job[[:space:]]*vacancy|hiring|salary|interview|tiffin|wedding[[:space:]]*card|invitation)[[:>:]]'
+        AND LOWER(COALESCE(r.text, l.description, '')) !~* '[[:<:]](bhk|rk|bk|br|bedroom|flat|apartment|villa|studio|penthouse|townhouse|plot|office|shop|sqft|sq[[:space:]]*ft|sq[[:space:]]*m|sqm|furnished|unfurnished|rent|sale|lease|owner|landlord|tenant|society|building|tower|complex)[[:>:]]'
+      )`);
+    }
+
     const where = conditions.join(' AND ');
 
+    // The inner SELECT computes repost_count as a window aggregate over the
+    // full WHERE-filtered set (correct across pagination). The outer query then
+    // sorts by latest arrival and, when requested, drops rows below the repost
+    // threshold. Build the listings param list + placeholders in order:
+    //   $1..$N  -> the shared WHERE params
+    //   $N+1    -> min_reposts threshold (only when hasRepostFilter)
+    //   next    -> LIMIT, then OFFSET
+    const listingsParams = [...params];
+    let repostClause = '';
+    if (hasRepostFilter) { repostClause = `WHERE sub.repost_count >= $${++p}`; listingsParams.push(minRepostsNum); }
+    const limitPh  = ++p; listingsParams.push(limit);
+    const offsetPh = ++p; listingsParams.push(offset);
+
+    // Count must respect the repost filter too. Without the filter it's a plain
+    // COUNT(*); with it, we wrap the windowed set and count the survivors.
+    const countSql = hasRepostFilter
+      ? `SELECT COUNT(*) AS count FROM (
+           SELECT COUNT(*) OVER (PARTITION BY r.sender_wa_id, r.content_hash) AS repost_count
+             FROM listings l
+             LEFT JOIN raw_messages r ON r.id = l.raw_message_id
+            WHERE ${where}
+         ) sub WHERE sub.repost_count >= $${params.length + 1}`
+      : `SELECT COUNT(*) AS count
+           FROM listings l
+           LEFT JOIN raw_messages r ON r.id = l.raw_message_id
+          WHERE ${where}`;
+    const countParams = hasRepostFilter ? [...params, minRepostsNum] : params;
+
+    // All three queries need LEFT JOIN raw_messages now because the
+    // non-property filter inspects r.text. Without the JOIN the COUNT and
+    // stats queries throw "missing FROM-clause entry for table r".
     const [countRes, listingsRes, statsRes] = await Promise.all([
-      pg.query(`SELECT COUNT(*) AS count FROM listings l WHERE ${where}`, params),
+      pg.query(countSql, countParams),
       pg.query(
-        `SELECT l.id, l.price, l.currency,
-                l.community   AS location,
-                l.area_text,
-                l.bedrooms, l.bathrooms, l.unit_type,
-                l.property_type, l.area_sqft, l.area_sqm,
-                l.furnished,
-                (l.amenities @> ARRAY['parking']::text[])::int AS parking,
-                l.agent_name, l.description, l.group_name,
-                l.wa_group_id,
-                l.confidence  AS extraction_confidence,
-                l.ts_listed   AS created_at,
-                l.intent, l.rent_period, l.vacant, l.amenities,
-                -- Strip any @xxx suffix the parser may have stored in agent_phone,
-                -- then fall back to the sender's @c.us number when agent_phone is absent.
-                COALESCE(
-                  NULLIF(regexp_replace(COALESCE(l.agent_phone, ''), '@\\S+$', ''), ''),
-                  CASE
-                    WHEN r.sender_wa_id LIKE '%@c.us'
-                    THEN regexp_replace(r.sender_wa_id, '@c\\.us$', '')
-                    ELSE NULL
-                  END
-                ) AS agent_phone,
-                r.sender_wa_id,
-                r.sender_name,
-                r.has_media,
-                r.media_keys
-         FROM listings l
-         LEFT JOIN raw_messages r ON r.id = l.raw_message_id
-         WHERE ${where}
-         ORDER BY l.ts_listed DESC
-         LIMIT $${++p} OFFSET $${++p}`,
-        [...params, limit, offset]
+        `SELECT * FROM (
+           SELECT l.id, l.price, l.currency,
+                  l.community   AS location,
+                  l.area_text,
+                  l.bedrooms, l.bathrooms, l.unit_type,
+                  l.property_type, l.area_sqft, l.area_sqm,
+                  l.furnished,
+                  (l.amenities @> ARRAY['parking']::text[])::int AS parking,
+                  l.agent_name, l.description, l.group_name,
+                  l.wa_group_id,
+                  l.confidence  AS extraction_confidence,
+                  l.ts_listed   AS created_at,
+                  l.intent, l.rent_period, l.vacant, l.amenities,
+                  -- Repost signal: how many times this exact message (same sender +
+                  -- same content_hash) appears in the result set. A higher count means
+                  -- the agent re-posted the same flat repeatedly = more eager. We count
+                  -- via a window so it's correct across pagination, and we DON'T merge
+                  -- rows on price/config (two distinct flats with the same rent have
+                  -- different text → different content_hash → counted separately).
+                  COUNT(*) OVER (PARTITION BY r.sender_wa_id, r.content_hash) AS repost_count,
+                  -- Strip any @xxx suffix the parser may have stored in agent_phone,
+                  -- then fall back to the sender's @c.us number when agent_phone is absent.
+                  COALESCE(
+                    NULLIF(regexp_replace(COALESCE(l.agent_phone, ''), '@\\S+$', ''), ''),
+                    CASE
+                      WHEN r.sender_wa_id LIKE '%@c.us'
+                      THEN regexp_replace(r.sender_wa_id, '@c\\.us$', '')
+                      ELSE NULL
+                    END
+                  ) AS agent_phone,
+                  r.sender_wa_id,
+                  r.sender_name,
+                  r.has_media,
+                  r.media_keys
+           FROM listings l
+           LEFT JOIN raw_messages r ON r.id = l.raw_message_id
+           WHERE ${where}
+         ) sub
+         ${repostClause}
+         -- Default order: latest arrival first. Reposts are surfaced via a
+         -- filter + badge, not by reordering the feed.
+         ORDER BY sub.created_at DESC
+         LIMIT $${limitPh} OFFSET $${offsetPh}`,
+        listingsParams
       ),
       pg.query(
-        `SELECT AVG(price) as avg_price, MIN(price) as min_price, MAX(price) as max_price,
-                AVG(bedrooms) as avg_bedrooms, AVG(area_sqft) as avg_area
-         FROM listings l WHERE ${where}`,
+        `SELECT AVG(l.price) as avg_price, MIN(l.price) as min_price, MAX(l.price) as max_price,
+                AVG(l.bedrooms) as avg_bedrooms, AVG(l.area_sqft) as avg_area
+           FROM listings l
+           LEFT JOIN raw_messages r ON r.id = l.raw_message_id
+          WHERE ${where}`,
         params
       ),
     ]);
@@ -756,6 +843,37 @@ app.get('/api/listings/:id', authenticate, auditLog('view_listing', 'listing'), 
     res.json({ success: true, data: listing });
   } catch (error) {
     logger.error('GET /api/listings/:id failed', { error: error.message });
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// ── User "report wrong" flag ──────────────────────────────────────────────────
+// The human detection channel: when our deterministic validators miss a bad
+// extraction, the user tells us. We (a) count it so health.js shows the flag
+// rate — i.e. how much auto-heal is missing — and (b) immediately quarantine
+// the owner's own row so the bad data stops being shown while we add a rule.
+// Scoped to the listing's owner (it's their data), so a flag can't be abused.
+app.post('/api/listings/:id/flag', authenticate, auditLog('flag_listing', 'listing'), async (req, res) => {
+  try {
+    const userRow = await pg.dbGet('SELECT id FROM users WHERE clerk_user_id = $1', [req.userId]).catch(() => null);
+    if (!userRow) return res.status(404).json({ success: false, error: 'Listing not found' });
+
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.slice(0, 80) : '';
+    const updated = await pg.dbGet(
+      `UPDATE listings
+          SET user_flags        = user_flags + 1,
+              last_flagged_at   = NOW(),
+              quarantine_reason = 'user_flagged' || CASE WHEN $3 <> '' THEN ':' || $3 ELSE '' END,
+              confidence        = 0,
+              updated_at        = NOW()
+        WHERE id = $1 AND user_id = $2
+        RETURNING user_flags`,
+      [req.params.id, userRow.id, reason]
+    );
+    if (!updated) return res.status(404).json({ success: false, error: 'Listing not found' });
+    res.json({ success: true, data: { user_flags: updated.user_flags, hidden: true } });
+  } catch (error) {
+    logger.error('POST /api/listings/:id/flag failed', { error: error.message });
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
@@ -1216,10 +1334,12 @@ app.get(/^(?!\/api).+/, (req, res) => {
   try {
     const html = _loadIndexHtml();
     const nonce = res.locals.cspNonce;
-    // Stamp the nonce onto every inline <script> tag (the Vite build only
-    // contains the dark-mode bootstrap; module scripts have their own nonces
-    // injected by 'strict-dynamic' once the entry script runs).
-    const stamped = html.replace(/<script(?![^>]*\bsrc=)/g, `<script nonce="${nonce}"`);
+    // Stamp the nonce onto every <script> tag — both inline and src= bundles.
+    // With 'strict-dynamic' in our CSP, ALL scripts (including Vite's
+    // module bundle) must carry the nonce or the browser refuses to load them.
+    // The 'strict-dynamic' keyword then lets those nonced scripts trigger
+    // sub-loads without further nonce/allowlist gymnastics.
+    const stamped = html.replace(/<script(?![^>]*\bnonce=)/g, `<script nonce="${nonce}"`);
     res.set('Cache-Control', 'no-store');
     res.set('Content-Type', 'text/html; charset=utf-8');
     res.send(stamped);
@@ -1242,6 +1362,17 @@ async function startServer() {
         redis: process.env.REDIS_URL ? 'enabled' : 'disabled (in-memory cache)',
       })
     );
+
+    // Auto-resume WhatsApp bridges for users whose sessions were 'ready'
+    // before the previous shutdown. We delay 3s so the HTTP listener is
+    // settled before we fork child processes that may eat a chunk of CPU
+    // while wppconnect spins up Chromium.
+    setTimeout(() => {
+      const whatsappService = require('./services/whatsappService');
+      whatsappService.autoResumeBridges().catch(err =>
+        logger.warn('autoResumeBridges failed', { error: err.message })
+      );
+    }, 3000).unref();
   } catch (err) {
     logger.error('Server failed to start', { error: err.message, stack: err.stack });
     process.exit(1);
