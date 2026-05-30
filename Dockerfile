@@ -7,13 +7,9 @@ RUN npm ci
 COPY dashboard/ ./
 
 # Vite inlines VITE_* vars into the bundle at BUILD time. The Clerk publishable
-# key is a PUBLIC client key (pk_test_/pk_live_) and must be present here, or
+# key is a PUBLIC client key (pk_test_/pk_live_) and must be present, or
 # ClerkProvider boots with publishableKey=undefined and sign-in silently dies.
-# Railway exposes service variables as build args — declare the ARG to receive it.
-# Build cache invalidation: 2026-05-30T13:25:00Z
-ARG VITE_CLERK_PUBLISHABLE_KEY
-ENV VITE_CLERK_PUBLISHABLE_KEY=$VITE_CLERK_PUBLISHABLE_KEY
-
+# The key is sourced from dashboard/.env.local (which Vite reads during build).
 RUN npm run build
 
 # ── Stage 2: Production server ─────────────────────────────────────────────
