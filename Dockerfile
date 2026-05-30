@@ -5,6 +5,14 @@ WORKDIR /build/dashboard
 COPY dashboard/package*.json ./
 RUN npm ci
 COPY dashboard/ ./
+
+# Vite inlines VITE_* vars into the bundle at BUILD time. The Clerk publishable
+# key is a PUBLIC client key (pk_test_/pk_live_) and must be present here, or
+# ClerkProvider boots with publishableKey=undefined and sign-in silently dies.
+# Railway exposes service variables as build args — declare the ARG to receive it.
+ARG VITE_CLERK_PUBLISHABLE_KEY
+ENV VITE_CLERK_PUBLISHABLE_KEY=$VITE_CLERK_PUBLISHABLE_KEY
+
 RUN npm run build
 
 # ── Stage 2: Production server ─────────────────────────────────────────────
