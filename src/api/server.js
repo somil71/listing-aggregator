@@ -109,42 +109,66 @@ const pgPoolSaturation = new promClient.Gauge({
 // ── Postgres schema bootstrap — runs on every cold start ─────────────────────
 // Applies any .sql migration files in src/db/postgres/ that haven't been run yet.
 // Applied migrations are tracked in schema_migrations so each file runs exactly once.
-// Failures throw — the server must not start with an incomplete schema.
+// Individual migration failures are NON-FATAL — the server starts regardless so
+// endpoints that don't need the missing table still work. Failed migrations are
+// retried on the next startup (they're not recorded in schema_migrations).
 async function runPostgresMigrations() {
   const migrationsDir = path.resolve(__dirname, '../db/postgres');
-  const files = fs.readdirSync(migrationsDir)
-    .filter(f => f.endsWith('.sql'))
-    .sort();
-
-  const client = await pg.pool.connect();
+  let files;
   try {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        name       TEXT PRIMARY KEY,
-        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
+    files = fs.readdirSync(migrationsDir).filter(f => f.endsWith('.sql')).sort();
+  } catch (err) {
+    logger.warn(`PG migrations: cannot read migrations dir — ${err.message}`);
+    return;
+  }
+
+  let client;
+  try {
+    client = await pg.pool.connect();
+  } catch (err) {
+    logger.warn(`PG migrations: cannot connect to Postgres — ${err.message}`);
+    return;
+  }
+
+  try {
+    try {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          name       TEXT PRIMARY KEY,
+          applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+    } catch (err) {
+      logger.warn(`PG migrations: cannot create tracking table — ${err.message}`);
+      return;
+    }
 
     for (const file of files) {
-      const { rows } = await client.query(
-        'SELECT 1 FROM schema_migrations WHERE name = $1', [file]
-      );
-      if (rows.length > 0) {
-        logger.debug(`PG migration already applied: ${file}`);
-        continue;
-      }
-
-      const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
       try {
+        const { rows } = await client.query(
+          'SELECT 1 FROM schema_migrations WHERE name = $1', [file]
+        );
+        if (rows.length > 0) {
+          logger.debug(`PG migration already applied: ${file}`);
+          continue;
+        }
+
+        const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
         await client.query('BEGIN');
-        await client.query(sql);
-        await client.query('INSERT INTO schema_migrations (name) VALUES ($1)', [file]);
-        await client.query('COMMIT');
-        logger.info(`PG migration applied: ${file}`);
+        try {
+          await client.query(sql);
+          await client.query(
+            'INSERT INTO schema_migrations (name) VALUES ($1) ON CONFLICT DO NOTHING', [file]
+          );
+          await client.query('COMMIT');
+          logger.info(`PG migration applied: ${file}`);
+        } catch (err) {
+          await client.query('ROLLBACK').catch(() => {});
+          logger.error(`PG migration skipped (non-fatal): ${file} — ${err.message}`);
+          // Continue to next migration — do not crash the server
+        }
       } catch (err) {
-        await client.query('ROLLBACK').catch(() => {});
-        logger.error(`PG migration FAILED: ${file} — ${err.message}`);
-        throw err;
+        logger.error(`PG migration error checking status of ${file} — ${err.message}`);
       }
     }
   } finally {
