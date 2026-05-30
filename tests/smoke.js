@@ -37,21 +37,22 @@ async function runSmoke() {
   console.log('\n1️⃣  SMOKE TESTS');
   console.log('='.repeat(60));
 
-  // 1.1 Health endpoint
+  // 1.1 Health endpoint — hardened contract: minimal { success, status:'ok' }.
+  // Verbose fields (database/memory/uptime) were intentionally removed so the
+  // public health endpoint can't be used to fingerprint internals. A 200 here
+  // already proves DB connectivity: /health runs `SELECT 1` and returns 503 if
+  // the database is unreachable (see src/api/server.js). Internal observability
+  // lives on the token-gated /api/v1/metrics endpoint instead.
   console.log('\n1.1 Health Endpoint');
   try {
     const t0 = Date.now();
     const r = await get('/health');
     const ms = Date.now() - t0;
 
-    check('Status 200',           r.status === 200);
+    check('Status 200 (implies DB reachable)', r.status === 200);
     check('Response < 500ms',     ms < 500, `${ms}ms`);
     check('success: true',        r.body?.success === true);
-    check('status: healthy',      r.body?.status === 'healthy');
-    check('database.connected',   r.body?.database?.connected === true);
-    const heapMb = r.body?.memory?.heap_used_mb ?? r.body?.memory?.used ?? 999;
-    check('memory < 500 MB', heapMb < 500, `${heapMb} MB`);
-    check('uptime > 0',           (r.body?.uptime ?? 0) > 0);
+    check('status: ok',           r.body?.status === 'ok');
   } catch (err) {
     check('Health endpoint reachable', false, err.message);
   }

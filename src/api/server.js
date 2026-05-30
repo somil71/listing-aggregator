@@ -384,7 +384,12 @@ app.get('/health', async (req, res) => {
 app.get('/api/v1/metrics', async (req, res) => {
   const expected = process.env.METRICS_TOKEN;
   if (!expected) return res.status(404).end('Not found');
-  const provided = req.headers['x-metrics-token'];
+  // Accept the token either via the dedicated `x-metrics-token` header OR as a
+  // standard `Authorization: Bearer <token>` credential. The Bearer form lets
+  // Prometheus authenticate with its native `authorization` scrape config (see
+  // monitoring/prometheus.yml) without needing a custom-header extension.
+  const bearer   = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  const provided = req.headers['x-metrics-token'] || bearer;
   if (!provided || provided !== expected) return res.status(401).end('Unauthorized');
   res.set('Content-Type', metricsRegistry.contentType);
   res.end(await metricsRegistry.metrics());
