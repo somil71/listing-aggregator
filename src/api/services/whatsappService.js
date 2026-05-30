@@ -475,6 +475,13 @@ class WhatsAppService {
       const raw = String(data.message || 'Unknown error');
       console.error(`[whatsapp] bridge error for ${userId}:`, raw);
       this._initializing?.delete(userId);
+      // If a getGroups() call is waiting on the bridge, reject it now with the
+      // real reason instead of letting it hang until the 130s timeout (→ 500).
+      const pendingGroups = this._groupsByUser?.get(userId);
+      if (pendingGroups?.reject) {
+        this._groupsByUser.delete(userId);
+        pendingGroups.reject(new Error(raw));
+      }
       // Clean wppconnect's internal stack-trace noise before forwarding —
       // users should never see "static.whatsapp.net/...js:7" line refs.
       const cleaned = raw

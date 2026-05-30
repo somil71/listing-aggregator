@@ -518,9 +518,14 @@ async function dispatchCmd(cmd) {
       })().catch(err => emit('error', { message: 'start_monitoring: ' + err.message }));
     } else if (cmd.cmd === 'get_groups') {
       if (!activeClient) {
-        emit('error', { message: 'Client not ready yet' });
+        // Non-fatal: emitting a top-level 'error' here would tear the client
+        // down on the server AND leave getGroups() hanging until its 130s
+        // timeout. Return an empty result so the caller resolves immediately.
+        process.stderr.write('[bridge] get_groups: client not ready, returning empty\n');
+        emit('groups', { groups: [], totalChats: 0, attempts: 0, notReady: true });
         return;
       }
+      process.stderr.write('[bridge] get_groups: scan starting\n');
       // wppconnect's chat DB isn't populated the instant `ready` fires — it
       // hydrates over the next 5–30 seconds as the WA Web client syncs.
       // Poll until we see chats, then return the groups.  Up to 90s total.
@@ -581,6 +586,9 @@ async function dispatchCmd(cmd) {
           attempts++;
           const groups = filterGroups(await fetchGroupChats());
           if (groups.length > best.length) best = groups;
+          if (attempts === 1) {
+            process.stderr.write(`[bridge] get_groups: first fetch → ${groups.length} groups\n`);
+          }
           emit('groups_progress', {
             attempt: attempts,
             totalChats: groups.length,
@@ -603,7 +611,14 @@ async function dispatchCmd(cmd) {
         }
         // Timed out — return the best set we saw rather than risk a final empty fetch
         emit('groups', { groups: best, totalChats: best.length, attempts, timedOut: true });
-      })().catch(err => emit('error', { message: 'get_groups: ' + err.message }));
+      })().catch(err => {
+        // A group-scan hiccup must NOT emit a top-level 'error' — that tears the
+        // whole client down on the server and leaves getGroups() hanging until
+        // its 130s timeout (→ generic 500). Log for diagnosis and return a
+        // non-fatal empty result so the caller resolves fast.
+        process.stderr.write(`[bridge] get_groups failed: ${err && err.stack ? err.stack : err}\n`);
+        emit('groups', { groups: [], totalChats: 0, attempts: 0, error: String((err && err.message) || err), timedOut: true });
+      });
     }
   } catch (err) {
     emit('error', { message: 'dispatchCmd: ' + err.message });
