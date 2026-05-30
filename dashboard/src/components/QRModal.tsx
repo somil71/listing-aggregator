@@ -81,6 +81,25 @@ export default function QRModal({ onClose, onConnected }: Props) {
 
   useEffect(() => { phaseRef.current = phase; }, [phase]);
 
+  // Fallback transition. The `authenticated` SSE event is transient: the
+  // EventSource reconnects periodically and the server replays only the LATEST
+  // event, so if `authenticated` fired during a reconnect gap the client never
+  // sees it and stays on the QR even though the phone is linked. Poll /status
+  // while pre-terminal and advance to group selection once the bridge reports
+  // connected.
+  useEffect(() => {
+    if (phase === 'select_groups' || phase === 'authenticated' || phase === 'error') return;
+    let cancelled = false;
+    const id = setInterval(async () => {
+      try {
+        const res = await api.getStatus();
+        if (!cancelled && res?.data?.connected) setPhase('select_groups');
+      } catch (_) { /* transient — keep polling */ }
+    }, 3000);
+    return () => { cancelled = true; clearInterval(id); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase]);
+
   // Step 1: wait for Clerk to finish loading, THEN open the SSE stream.
   useEffect(() => {
     if (!isLoaded || !isSignedIn) return;

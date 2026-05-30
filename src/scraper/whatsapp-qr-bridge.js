@@ -533,13 +533,20 @@ async function dispatchCmd(cmd) {
           new Promise((_, rej) => setTimeout(() => rej(new Error('fetchChats timeout')), ms)),
         ]);
 
-        const fetchChats = async () => {
-          // Try wppconnect APIs in order of preference, each capped at 15s
-          if (typeof activeClient.getAllChats === 'function') {
-            try { return await withTimeout(activeClient.getAllChats(), 15_000); } catch (_) {}
-          }
+        // Fetch ONLY groups straight from wppconnect's store. getAllChats()
+        // serializes every chat (500+) out of the browser context and routinely
+        // hangs past 15s, so its count flaps 0↔N and never stabilizes;
+        // listChats({onlyGroups:true}) returns just the groups — far smaller and
+        // it settles in seconds.
+        const fetchGroupChats = async () => {
           if (typeof activeClient.listChats === 'function') {
-            try { return await withTimeout(activeClient.listChats(), 15_000); } catch (_) {}
+            try { return (await withTimeout(activeClient.listChats({ onlyGroups: true }), 20_000)) || []; } catch (_) {}
+          }
+          if (typeof activeClient.getAllGroups === 'function') {
+            try { return (await withTimeout(activeClient.getAllGroups(false), 20_000)) || []; } catch (_) {}
+          }
+          if (typeof activeClient.getAllChats === 'function') {
+            try { return (await withTimeout(activeClient.getAllChats(), 20_000)) || []; } catch (_) {}
           }
           return [];
         };
@@ -561,46 +568,41 @@ async function dispatchCmd(cmd) {
           .filter(g => g.id);
 
         const startedAt = Date.now();
-        const MAX_MS    = 120_000;  // 2 minutes total — WA Web can be slow to hydrate
-        const STABLE_MS = 15_000;  // count must stay identical for 15 s before we accept it
-        const MIN_MS    = 10_000;  // always wait at least 10 s even if instantly stable
+        // MAX_MS must stay well under the server's 130s getGroups timeout so the
+        // bridge always answers before the server gives up (which surfaced as 500).
+        const MAX_MS    = 75_000;
+        const STABLE_MS = 8_000;   // group count steady for 8 s → accept
+        const MIN_MS    = 5_000;   // always wait at least 5 s for hydration
         let attempts = 0;
         let lastCount = -1;
         let stableSince = 0;
+        let best = [];             // largest group set seen — never regress on a transient empty fetch
         while (Date.now() - startedAt < MAX_MS) {
           attempts++;
-          const raw = await fetchChats();
-          const groups = filterGroups(raw);
+          const groups = filterGroups(await fetchGroupChats());
+          if (groups.length > best.length) best = groups;
           emit('groups_progress', {
             attempt: attempts,
-            totalChats: raw.length,
+            totalChats: groups.length,
             groupsFound: groups.length,
             elapsedMs: Date.now() - startedAt,
           });
-          if (raw.length !== lastCount) {
-            // count changed — reset stability window
-            lastCount = raw.length;
+          if (groups.length !== lastCount) {
+            // count changed — reset the stability window
+            lastCount = groups.length;
             stableSince = Date.now();
           } else if (
-            raw.length > 0 &&
+            groups.length > 0 &&
             Date.now() - stableSince >= STABLE_MS &&
             Date.now() - startedAt  >= MIN_MS
           ) {
-            // count stable for 15 s AND we've waited at least 10 s — done
-            emit('groups', { groups, totalChats: raw.length, attempts });
+            emit('groups', { groups: best, totalChats: best.length, attempts });
             return;
           }
-          // poll every 2s while syncing (each fetchChats is already capped at 15s)
           await new Promise(r => setTimeout(r, 2000));
         }
-        // Timed out — return whatever we have
-        const finalRaw = await fetchChats();
-        emit('groups', {
-          groups: filterGroups(finalRaw),
-          totalChats: finalRaw.length,
-          attempts,
-          timedOut: true,
-        });
+        // Timed out — return the best set we saw rather than risk a final empty fetch
+        emit('groups', { groups: best, totalChats: best.length, attempts, timedOut: true });
       })().catch(err => emit('error', { message: 'get_groups: ' + err.message }));
     }
   } catch (err) {
