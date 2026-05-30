@@ -1,15 +1,19 @@
 # ── Stage 1: Build React dashboard ────────────────────────────────────────
 FROM node:20-alpine AS dashboard-build
 
+# Cache-bust: 2026-05-30-v2 — forces a fresh npm run build so
+# VITE_CLERK_PUBLISHABLE_KEY (passed as a build arg by Railway) is inlined.
+RUN echo "cache-bust-2026-05-30-v2"
+
 WORKDIR /build/dashboard
 COPY dashboard/package*.json ./
 RUN npm ci
 COPY dashboard/ ./
 
-# Vite inlines VITE_* vars into the bundle at BUILD time. The Clerk publishable
-# key is a PUBLIC client key (pk_test_/pk_live_) and must be present, or
-# ClerkProvider boots with publishableKey=undefined and sign-in silently dies.
-# The key is sourced from dashboard/.env.local (which Vite reads during build).
+# Vite inlines VITE_* vars at BUILD time — must be present here or
+# ClerkProvider gets publishableKey=undefined and sign-in silently dies.
+ARG VITE_CLERK_PUBLISHABLE_KEY
+ENV VITE_CLERK_PUBLISHABLE_KEY=$VITE_CLERK_PUBLISHABLE_KEY
 RUN npm run build
 
 # ── Stage 2: Production server ─────────────────────────────────────────────
