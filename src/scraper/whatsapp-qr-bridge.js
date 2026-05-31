@@ -268,6 +268,63 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
     },
   });
 
+  // ── ISOLATION INSTRUMENTATION ────────────────────────────────────────────
+  // We don't yet know WHERE backfill stalls. Wrap every CDP call so each one
+  // logs: when it started, how long it ran, and the full error if it threw.
+  // This lets us see in the logs exactly which call hangs and for how long,
+  // rather than guessing that "openChat times out".
+  const timed = async (label, fn, extra = {}) => {
+    const t0 = Date.now();
+    emit('cdp_start', { groupName, label, ...extra });
+    process.stderr.write(`[bridge] CDP→ ${label} (${groupName})\n`);
+    try {
+      const result = await fn();
+      const ms = Date.now() - t0;
+      emit('cdp_ok', { groupName, label, ms, ...extra });
+      process.stderr.write(`[bridge] CDP✓ ${label} ${ms}ms\n`);
+      return result;
+    } catch (e) {
+      const ms = Date.now() - t0;
+      emit('cdp_fail', {
+        groupName, label, ms,
+        error: e.message,
+        stack: (e.stack || '').split('\n').slice(0, 4).join(' | '),
+        ...extra,
+      });
+      process.stderr.write(`[bridge] CDP✗ ${label} ${ms}ms — ${e.message}\n`);
+      throw e;
+    }
+  };
+
+  // Pre-flight: is the page/CDP channel even responsive RIGHT NOW? Probe with
+  // the cheapest call available. If this returns fast but openChat hangs, the
+  // problem is openChat specifically. If this ALSO hangs, the whole Chromium
+  // page is frozen (different bug — likely OOM / crashed renderer).
+  const probePage = async () => {
+    const probes = ['getConnectionState', 'isConnected', 'getWAVersion', 'getHostDevice'];
+    for (const p of probes) {
+      if (!list(p)) continue;
+      const t0 = Date.now();
+      try {
+        const r = await Promise.race([
+          activeClient[p](),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('probe timeout 15s')), 15_000)),
+        ]);
+        emit('backfill_probe', {
+          groupName, probe: p, ms: Date.now() - t0,
+          alive: true, result: String(r && r.id ? r.id : r).slice(0, 40),
+        });
+        return true;
+      } catch (e) {
+        emit('backfill_probe', {
+          groupName, probe: p, ms: Date.now() - t0, alive: false, error: e.message,
+        });
+        // try the next probe method before declaring the page dead
+      }
+    }
+    return false;
+  };
+
   let messages = [];
 
   // Step 0: WhatsApp Web only fetches a chat's message history when the chat
@@ -282,29 +339,33 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
     let opened = false;
     let lastErr = null;
     for (let attempt = 1; attempt <= 8 && !opened; attempt++) {
+      // ISOLATION: before each openChat, probe whether the page is alive at all.
+      // This separates "openChat is slow" from "the whole renderer is frozen".
+      const pageAlive = await probePage();
+      emit('backfill_openchat_attempt', {
+        groupId, groupName, attempt, pageAlive,
+      });
+
       try {
         // Scale timeout: start at 180s, increase 60s per attempt, cap at 10 min.
-        // Early attempts are quick (180s), later attempts get more time (up to 600s).
         const timeoutMs = Math.min(600_000, 180_000 + (attempt - 1) * 60_000);
-        emit('backfill_openchat_attempt', {
-          groupId, groupName, attempt,
-          timeoutMs,
-        });
-        // Wrap in Promise.race to enforce a hard timeout per attempt.
-        // This ensures we don't hang indefinitely on a single CDP call.
-        const openPromise = activeClient.openChat(groupId);
-        const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(
-            () => reject(new Error(`openChat Promise timeout after ${timeoutMs}ms`)),
-            timeoutMs
-          )
-        );
-        await Promise.race([openPromise, timeoutPromise]);
+        // timed() logs start + duration + full error, so the logs show exactly
+        // how long openChat ran before it hung or rejected.
+        await timed('openChat', () => {
+          const openPromise = activeClient.openChat(groupId);
+          const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(
+              () => reject(new Error(`openChat Promise timeout after ${timeoutMs}ms`)),
+              timeoutMs
+            )
+          );
+          return Promise.race([openPromise, timeoutPromise]);
+        }, { attempt, timeoutMs });
 
         await new Promise(r => setTimeout(r, 2500));
         // Mark as seen to make WA think we're actively viewing the chat
         if (list('sendSeen')) {
-          try { await activeClient.sendSeen(groupId); } catch (_) {}
+          try { await timed('sendSeen', () => activeClient.sendSeen(groupId), { attempt }); } catch (_) {}
         }
         opened = true;
         emit('backfill_chat_opened', { groupId, groupName, attempt });
@@ -315,7 +376,6 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
           attempt, message: `${e.message}`,
         });
         // Aggressive backoff: 1s for early attempts, scales up.
-        // The goal is to give the page time to recover without wasting too much time.
         const backoffMs = attempt <= 2 ? 1000 : 2000 + (attempt - 2) * 1500;
         await new Promise(r => setTimeout(r, backoffMs));
       }
@@ -343,9 +403,19 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
   // Step 1 (which scrolls UP for OLD history), this lets the NEWEST messages
   // land first.
   if (list('getAllMessagesInChat')) {
+    emit('backfill_step', { groupName, step: '0b_sync_start' });
     let prev = -1, stable = 0;
     for (let i = 0; i < 30 && stable < 4; i++) {
-      const peek = await activeClient.getAllMessagesInChat(groupId, true, false).catch(() => []);
+      const t0 = Date.now();
+      const peek = await activeClient.getAllMessagesInChat(groupId, true, false).catch((e) => {
+        emit('cdp_fail', { groupName, label: 'getAllMessagesInChat(sync)', iter: i, ms: Date.now() - t0, error: e.message });
+        return [];
+      });
+      const ms = Date.now() - t0;
+      // Only log slow peeks (>3s) or the first iteration — avoid flooding logs.
+      if (i === 0 || ms > 3000) {
+        emit('cdp_ok', { groupName, label: 'getAllMessagesInChat(sync)', iter: i, ms, count: peek.length });
+      }
       if (peek.length === prev) stable++; else { stable = 0; prev = peek.length; }
       await new Promise(r => setTimeout(r, 1000));
     }
@@ -357,23 +427,34 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
   // open, loadEarlierMessages actually triggers backend fetches.
   try {
     if (list('loadEarlierMessages')) {
+      emit('backfill_step', { groupName, step: '1_scroll_start' });
       let stable = 0;
       let lastCount = -1;
       for (let i = 0; i < 50 && stable < 4; i++) {
+        const t0 = Date.now();
         try {
           const result = await activeClient.loadEarlierMessages(groupId);
+          const ms = Date.now() - t0;
+          if (i === 0 || ms > 3000) {
+            emit('cdp_ok', { groupName, label: 'loadEarlierMessages', iter: i, ms });
+          }
           // result is usually an array — empty means "no more to load"
           if (Array.isArray(result) && result.length === 0) stable++;
           else stable = 0;
           // small wait so WA Web can fetch + render
           await new Promise(r => setTimeout(r, 600));
         } catch (e) {
+          emit('cdp_fail', { groupName, label: 'loadEarlierMessages', iter: i, ms: Date.now() - t0, error: e.message });
           // some chats reject when at top; treat as "no more"
           stable++;
         }
         // peek at total count so far
         if (list('getAllMessagesInChat')) {
-          const peek = await activeClient.getAllMessagesInChat(groupId, true, false).catch(() => []);
+          const tp = Date.now();
+          const peek = await activeClient.getAllMessagesInChat(groupId, true, false).catch((e) => {
+            emit('cdp_fail', { groupName, label: 'getAllMessagesInChat(scroll)', iter: i, ms: Date.now() - tp, error: e.message });
+            return [];
+          });
           if (peek.length === lastCount) stable++; else stable = 0;
           lastCount = peek.length;
           if (peek.length >= targetCount) break;
@@ -388,9 +469,10 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
   }
 
   // Step 2: harvest everything that's now loaded
+  emit('backfill_step', { groupName, step: '2_harvest_start' });
   if (list('getAllMessagesInChat')) {
     try {
-      messages = await activeClient.getAllMessagesInChat(groupId, true, false);
+      messages = await timed('getAllMessagesInChat(harvest)', () => activeClient.getAllMessagesInChat(groupId, true, false));
       emit('backfill_loaded', { groupName, method: 'getAllMessagesInChat', count: messages.length });
     } catch (e) {
       emit('backfill_warning', { groupName, reason: 'harvest_failed', message: e.message });
@@ -399,7 +481,7 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
 
   if (messages.length === 0 && list('loadAndGetAllMessagesInChat')) {
     try {
-      messages = await activeClient.loadAndGetAllMessagesInChat(groupId, true, false);
+      messages = await timed('loadAndGetAllMessagesInChat(harvest)', () => activeClient.loadAndGetAllMessagesInChat(groupId, true, false));
       emit('backfill_loaded', { groupName, method: 'loadAndGetAllMessagesInChat', count: messages.length });
     } catch (e) {
       emit('backfill_warning', { groupName, reason: 'harvest_failed', message: e.message });
@@ -408,10 +490,12 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
 
   if (messages.length === 0 && list('getMessages')) {
     try {
-      messages = await activeClient.getMessages(groupId, { count: targetCount, direction: 'before' });
+      messages = await timed('getMessages(harvest)', () => activeClient.getMessages(groupId, { count: targetCount, direction: 'before' }));
       emit('backfill_loaded', { groupName, method: 'getMessages', count: messages.length });
     } catch (_) {}
   }
+
+  emit('backfill_step', { groupName, step: '3_persist_start', toPersist: Math.min(messages.length, targetCount) });
 
   // Persist (most recent N up to targetCount, but oldest-first so chronology is preserved in DB)
   messages = messages.slice(-targetCount);
