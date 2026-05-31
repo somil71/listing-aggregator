@@ -348,15 +348,21 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
   // Step 0: WhatsApp Web only fetches a chat's message history when the chat
   // is "opened" (clicked) in the UI.  Without this, loadEarlierMessages is a
   // no-op.  We open the chat and wait briefly for the initial load.
+  //
+  // openChat is best-effort: on some Railway environments the CDP promise
+  // hangs indefinitely (page is alive but the JS event that resolves openChat
+  // never fires). We fail fast (3 × 30s = 90s max) and fall through to a
+  // direct harvest — getAllMessagesInChat (Step 2) reads from the in-memory WA
+  // store which is already populated by the multi-device history sync, so
+  // recent messages (last 24-72 h) are captured even without openChat.
+  let openChatSucceeded = false;
   if (list('openChat')) {
-    // openChat occasionally rejects with a transient Puppeteer error or CDP timeout
-    // ("Protocol error (Runtime.callFunctionOn): Promise was collected" or
-    //  "Runtime.callFunctionOn timed out"). On a busy DOM (after loading ~1000
-    // messages), even 300s might be insufficient. Retry with generous backoff,
-    // and wrap in a per-attempt timeout to catch hangs quickly and retry.
+    // openChat occasionally rejects with a transient Puppeteer error or CDP
+    // timeout. Retry a small number of times with a short per-attempt timeout
+    // so we fail fast when the environment doesn't support it.
     let opened = false;
     let lastErr = null;
-    for (let attempt = 1; attempt <= 8 && !opened; attempt++) {
+    for (let attempt = 1; attempt <= 3 && !opened; attempt++) {
       // ISOLATION: before each openChat, probe whether the page is alive at all.
       // This separates "openChat is slow" from "the whole renderer is frozen".
       const pageAlive = await probePage();
@@ -365,8 +371,10 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
       });
 
       try {
-        // Scale timeout: start at 180s, increase 60s per attempt, cap at 10 min.
-        const timeoutMs = Math.min(600_000, 180_000 + (attempt - 1) * 60_000);
+        // Short per-attempt timeout: if openChat hasn't resolved in 30s it is
+        // hanging indefinitely — fail fast so we can fall through to the direct
+        // store harvest below.
+        const timeoutMs = 30_000;
         // timed() logs start + duration + full error, so the logs show exactly
         // how long openChat ran before it hung or rejected.
         await timed('openChat', () => {
@@ -388,6 +396,7 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
         // opened immediately, then attempt sendSeen behind a hard 5s timeout
         // and never let it block.
         opened = true;
+        openChatSucceeded = true;
         emit('backfill_chat_opened', { groupId, groupName, attempt });
         if (list('sendSeen')) {
           try {
@@ -403,21 +412,22 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
           groupId, groupName, reason: 'open_retry',
           attempt, message: `${e.message}`,
         });
-        // Aggressive backoff: 1s for early attempts, scales up.
-        const backoffMs = attempt <= 2 ? 1000 : 2000 + (attempt - 2) * 1500;
-        await new Promise(r => setTimeout(r, backoffMs));
+        // Short backoff between fast retries.
+        await new Promise(r => setTimeout(r, 1000));
       }
     }
     if (!opened) {
-      // Exhausted retries. Skip this group's backfill but DO NOT emit 'error'
-      // — that would tear the whole modal into a fatal state. Live messages
-      // for other groups still flow normally.
+      // openChat exhausted its retries — this is non-fatal.
+      // loadEarlierMessages (Step 1) needs an open chat to trigger server fetches
+      // so it is skipped. But getAllMessagesInChat (Step 2) reads from the
+      // in-memory WA store which is populated by multi-device history sync,
+      // so recent messages are still harvested below.
       emit('backfill_warning', {
-        groupId, groupName, reason: 'open_failed',
+        groupId, groupName, reason: 'open_failed_continuing',
         message: lastErr ? lastErr.message : 'unknown',
-        exhaustedRetries: true,
+        note: 'Falling through to direct store harvest — Steps 0b and 2 still run',
       });
-      return 0;  // can't open the chat at all, nothing to backfill
+      // DO NOT return 0 — fall through to Steps 0b and 2 below.
     }
   }
 
@@ -453,7 +463,8 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
   // Step 1: scroll back through the chat repeatedly to force WA Web to
   // download historical messages from the server.  Now that the chat is
   // open, loadEarlierMessages actually triggers backend fetches.
-  try {
+  // Skipped when openChat didn't succeed — the scroll is a no-op without it.
+  if (openChatSucceeded) try {
     if (list('loadEarlierMessages')) {
       emit('backfill_step', { groupName, step: '1_scroll_start' });
       let stable = 0;
