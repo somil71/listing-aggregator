@@ -274,18 +274,32 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
   // is "opened" (clicked) in the UI.  Without this, loadEarlierMessages is a
   // no-op.  We open the chat and wait briefly for the initial load.
   if (list('openChat')) {
-    // openChat occasionally rejects with a transient Puppeteer error
-    // ("Protocol error (Runtime.callFunctionOn): Promise was collected")
-    // when WhatsApp Web's page context is GC'd mid-call — especially right
-    // after a (re)link while the store is still settling. This is NOT a
-    // permanent "user left the group" failure, so retry a few times before
-    // giving up. Without the retry, an active group can be skipped on every
-    // pass and its newest messages never get harvested.
+    // openChat occasionally rejects with a transient Puppeteer error or CDP timeout
+    // ("Protocol error (Runtime.callFunctionOn): Promise was collected" or
+    //  "Runtime.callFunctionOn timed out"). On a busy DOM (after loading ~1000
+    // messages), even 300s might be insufficient. Retry with generous backoff,
+    // and wrap in a per-attempt timeout to catch hangs quickly and retry.
     let opened = false;
     let lastErr = null;
-    for (let attempt = 1; attempt <= 4 && !opened; attempt++) {
+    for (let attempt = 1; attempt <= 6 && !opened; attempt++) {
       try {
-        await activeClient.openChat(groupId);
+        const timeoutMs = Math.min(420_000, 60_000 + attempt * 60_000);  // up to 7 min per attempt
+        emit('backfill_openchat_attempt', {
+          groupId, groupName, attempt,
+          timeoutMs,
+          elapsed: Math.round((Date.now() - Date.now()) / 1000),
+        });
+        // Wrap in Promise.race to enforce a hard timeout per attempt.
+        // This ensures we don't hang indefinitely on a single CDP call.
+        const openPromise = activeClient.openChat(groupId);
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`openChat Promise timeout after ${timeoutMs}ms`)),
+            timeoutMs
+          )
+        );
+        await Promise.race([openPromise, timeoutPromise]);
+
         await new Promise(r => setTimeout(r, 2500));
         // Mark as seen to make WA think we're actively viewing the chat
         if (list('sendSeen')) {
@@ -297,10 +311,11 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
         lastErr = e;
         emit('backfill_warning', {
           groupId, groupName, reason: 'open_retry',
-          message: `attempt ${attempt}: ${e.message}`,
+          attempt, message: `${e.message}`,
         });
-        // Back off a bit before retrying so the page context can recover.
-        await new Promise(r => setTimeout(r, 2000));
+        // Longer backoff so the page + DOM can stabilize. Longer on later attempts.
+        const backoffMs = 3000 + attempt * 2000;
+        await new Promise(r => setTimeout(r, backoffMs));
       }
     }
     if (!opened) {
@@ -310,6 +325,7 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
       emit('backfill_warning', {
         groupId, groupName, reason: 'open_failed',
         message: lastErr ? lastErr.message : 'unknown',
+        exhaustedRetries: true,
       });
       return 0;  // can't open the chat at all, nothing to backfill
     }
@@ -404,36 +420,46 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
   return stored;
 }
 
+const wppconnectConfig = {
+  session: userId,
+  folderNameToken: authDir, // where session is stored
+  headless: true,
+  devtools: false,
+  useChrome: true,
+  debug: false,
+  logQR: false, // we capture QR ourselves
+  // Keep the QR scannable for 5 min instead of wppconnect's ~60s default.
+  // The default fires 'autocloseCalled' and kills the session before a user
+  // can realistically open WhatsApp → Linked Devices → scan.
+  autoClose: 300000,
+  // Raise the per-CDP-call ceiling from puppeteer's default. Backfill's
+  // openChat()/getAllMessagesInChat() on a busy group runs a heavy
+  // Runtime.callFunctionOn. After the first backfill loads ~1000 messages
+  // into the DOM, subsequent backfills' openChat calls can stall >120s
+  // (page is slow with thousands of messages). 5 minutes should absorb
+  // even heavily-loaded pages.
+  // Try both top-level and nested puppeteerOptions variants.
+  protocolTimeout: 300_000,
+  puppeteerOptions: {
+    protocolTimeout: 300_000,
+  },
+  browserPathExecutable: chromeExec || undefined,
+  browserArgs: [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--no-restore-last-session',
+    '--disable-session-crashed-bubble',
+    '--no-first-run',
+    '--no-default-browser-check',
+  ],
+};
+
+emit('debug_config', { config: { ...wppconnectConfig, puppeteerOptions: '[puppeteerOptions]' } });
+
 wppconnect
   .create({
-    session: userId,
-    folderNameToken: authDir, // where session is stored
-    headless: true,
-    devtools: false,
-    useChrome: true,
-    debug: false,
-    logQR: false, // we capture QR ourselves
-    // Keep the QR scannable for 5 min instead of wppconnect's ~60s default.
-    // The default fires 'autocloseCalled' and kills the session before a user
-    // can realistically open WhatsApp → Linked Devices → scan.
-    autoClose: 300000,
-    // Raise the per-CDP-call ceiling from puppeteer's default. Backfill's
-    // openChat()/getAllMessagesInChat() on a busy group runs a heavy
-    // Runtime.callFunctionOn. After the first backfill loads ~1000 messages
-    // into the DOM, subsequent backfills' openChat calls can stall >120s
-    // (page is slow with thousands of messages). 5 minutes should absorb
-    // even heavily-loaded pages.
-    protocolTimeout: 300_000,
-    browserPathExecutable: chromeExec || undefined,
-    browserArgs: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--no-restore-last-session',
-      '--disable-session-crashed-bubble',
-      '--no-first-run',
-      '--no-default-browser-check',
-    ],
+    ...wppconnectConfig,
     catchQR: (base64Qrimg, asciiQR, attempt, urlCode) => {
       emit('qr', { qr: urlCode, image: base64Qrimg, attempt });
     },
