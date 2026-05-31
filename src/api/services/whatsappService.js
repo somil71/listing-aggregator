@@ -266,7 +266,12 @@ class WhatsAppService {
   // run in-process with our long-lived Express server.  As a child_process.fork()
   // it works fine.  Each user gets their own bridge subprocess.
 
-  async initiateQR(userId) {
+  // forceClean: wipe the Chromium profile before spawning.
+  // Always pass true for manual "Connect WhatsApp" clicks — stale session
+  // keys left over from a previous failed/expired link cause WhatsApp to
+  // reject the next QR scan with "could not link device" on the phone.
+  // autoResumeBridges() leaves this false so it restores the saved login.
+  async initiateQR(userId, { forceClean = false } = {}) {
     if (this.clients.has(userId)) {
       return { status: 'already_connected', message: 'Already connected' };
     }
@@ -304,21 +309,39 @@ class WhatsAppService {
       console.warn(`[whatsapp] orphan-Chrome cleanup failed for ${userId}: ${err.message}`);
     });
 
-    // Remove only Chromium SingletonLock files (release the profile without
-    // wiping the saved login).  If the saved login is actually corrupt the
-    // bridge will throw and we'll wipe + retry below.
     // wppconnect stores the Chromium profile at <folderNameToken>/<session>,
-    // i.e. authDir/<userId> (NOT session-<userId>). The lock files live there.
+    // i.e. authDir/<userId>. The session state (WhatsApp LocalStorage / IndexedDB)
+    // lives inside this profile dir.
     const profileDir = path.join(authDir, userId);
-    const stalePaths = [
-      path.join(profileDir, 'SingletonLock'),
-      path.join(profileDir, 'SingletonCookie'),
-      path.join(profileDir, 'SingletonSocket'),
-      path.join(profileDir, 'lockfile'),
-    ];
-    for (const f of stalePaths) {
-      try { fs.unlinkSync(f); } catch (_) {}
+
+    if (forceClean) {
+      // Wipe the entire Chromium profile so the next bridge starts with a
+      // completely blank WhatsApp Web state.  Without this, stale session keys
+      // (from a previous failed or expired QR scan within the same deploy) stay
+      // in Chrome's IndexedDB and cause WhatsApp to reject the new QR link with
+      // "could not link device" on the phone.
+      // Safe because: auto-resume (which needs the saved profile) never passes
+      // forceClean=true; this path is only reached on explicit user clicks.
+      try {
+        fs.rmSync(profileDir, { recursive: true, force: true });
+        console.log(`[whatsapp] cleared stale profile for ${userId} (forceClean)`);
+      } catch (e) {
+        console.warn(`[whatsapp] profile wipe failed for ${userId}: ${e.message}`);
+      }
+    } else {
+      // Remove only Chromium singleton lock files — release the profile without
+      // wiping the saved login so auto-resume can restore the session.
+      const stalePaths = [
+        path.join(profileDir, 'SingletonLock'),
+        path.join(profileDir, 'SingletonCookie'),
+        path.join(profileDir, 'SingletonSocket'),
+        path.join(profileDir, 'lockfile'),
+      ];
+      for (const f of stalePaths) {
+        try { fs.unlinkSync(f); } catch (_) {}
+      }
     }
+
     fs.mkdirSync(authDir, { recursive: true });
 
     const { spawn } = require('child_process');

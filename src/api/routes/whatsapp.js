@@ -53,7 +53,9 @@ router.get('/qr-stream', authenticateSSE, (req, res) => {
 router.post('/initiate-qr', authenticate, auditLog('initiate_qr', 'whatsapp'), async (req, res) => {
   try {
     const result = await whatsappBreaker.execute(
-      () => whatsappService.initiateQR(req.userId)
+      // forceClean wipes the Chromium profile before spawning so stale session
+      // keys from a previous failed/expired QR don't cause "could not link device".
+      () => whatsappService.initiateQR(req.userId, { forceClean: true })
     );
     // Lease conflict — another instance owns this user's session.
     // 409 is the right semantic: the resource exists but belongs elsewhere.
