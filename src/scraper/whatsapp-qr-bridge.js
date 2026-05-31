@@ -419,10 +419,11 @@ wppconnect
     autoClose: 300000,
     // Raise the per-CDP-call ceiling from puppeteer's default. Backfill's
     // openChat()/getAllMessagesInChat() on a busy group runs a heavy
-    // Runtime.callFunctionOn that was exceeding the default and rejecting with
-    // "Runtime.callFunctionOn timed out" (deploy f350d2b9 backfill_warning).
-    // This only bounds a single call — it does NOT delay normal operation.
-    puppeteerOptions: { protocolTimeout: 120_000 },
+    // Runtime.callFunctionOn. After the first backfill loads ~1000 messages
+    // into the DOM, subsequent backfills' openChat calls can stall >120s
+    // (page is slow with thousands of messages). 5 minutes should absorb
+    // even heavily-loaded pages.
+    protocolTimeout: 300_000,
     browserPathExecutable: chromeExec || undefined,
     browserArgs: [
       '--no-sandbox',
