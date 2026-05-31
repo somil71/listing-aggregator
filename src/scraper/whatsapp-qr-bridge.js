@@ -281,13 +281,14 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
     // and wrap in a per-attempt timeout to catch hangs quickly and retry.
     let opened = false;
     let lastErr = null;
-    for (let attempt = 1; attempt <= 6 && !opened; attempt++) {
+    for (let attempt = 1; attempt <= 8 && !opened; attempt++) {
       try {
-        const timeoutMs = Math.min(420_000, 60_000 + attempt * 60_000);  // up to 7 min per attempt
+        // Scale timeout: start at 180s, increase 60s per attempt, cap at 10 min.
+        // Early attempts are quick (180s), later attempts get more time (up to 600s).
+        const timeoutMs = Math.min(600_000, 180_000 + (attempt - 1) * 60_000);
         emit('backfill_openchat_attempt', {
           groupId, groupName, attempt,
           timeoutMs,
-          elapsed: Math.round((Date.now() - Date.now()) / 1000),
         });
         // Wrap in Promise.race to enforce a hard timeout per attempt.
         // This ensures we don't hang indefinitely on a single CDP call.
@@ -313,8 +314,9 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
           groupId, groupName, reason: 'open_retry',
           attempt, message: `${e.message}`,
         });
-        // Longer backoff so the page + DOM can stabilize. Longer on later attempts.
-        const backoffMs = 3000 + attempt * 2000;
+        // Aggressive backoff: 1s for early attempts, scales up.
+        // The goal is to give the page time to recover without wasting too much time.
+        const backoffMs = attempt <= 2 ? 1000 : 2000 + (attempt - 2) * 1500;
         await new Promise(r => setTimeout(r, backoffMs));
       }
     }
