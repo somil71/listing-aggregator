@@ -79,6 +79,24 @@ let qrReadEmitted = false;  // dedupe statusFind = 'qrReadSuccess' callbacks
 let monitoredGroupIds = new Set();  // group IDs currently being scraped
 let messageListenerWired = false;   // wppconnect onMessage subscription guard
 
+// ── Page mutex ────────────────────────────────────────────────────────────
+// All exclusive CDP sequences (backfill, get_groups scan) share ONE Chromium
+// page. Running two of them concurrently destroys the JS execution context
+// mid-call → "Protocol error (Runtime.callFunctionOn): Promise was collected".
+// withPageLock serialises them so only one heavy CDP sequence touches the page
+// at a time. It is FIFO and never rejects the chain (errors are swallowed for
+// the *chain*, but propagated to the caller of the locked fn).
+let _pageMutex = Promise.resolve();
+function withPageLock(fn) {
+  const run = _pageMutex.then(() => fn());
+  _pageMutex = run.then(() => {}, () => {});
+  return run;
+}
+
+// Guard so overlapping POST /rescrape (or repeated start_monitoring) don't
+// stack multiple full backfills over the same set of groups.
+let _backfillInFlight = false;
+
 // ── Message persistence (mirrors scraper/whatsapp-scraper.js but for wppconnect) ──
 async function downloadMedia(message, messageId) {
   if (!message.isMedia && !message.isMMS && !message.mimetype) return [];
@@ -363,12 +381,22 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
         }, { attempt, timeoutMs });
 
         await new Promise(r => setTimeout(r, 2500));
-        // Mark as seen to make WA think we're actively viewing the chat
-        if (list('sendSeen')) {
-          try { await timed('sendSeen', () => activeClient.sendSeen(groupId), { attempt }); } catch (_) {}
-        }
+        // openChat succeeded — record that FIRST. sendSeen is a non-essential
+        // "mark as read" nicety; isolation logs proved it can hang forever
+        // (no settle), and because it used to run BEFORE this emit it dead-
+        // stalled the entire backfill right after the chat opened. So: mark
+        // opened immediately, then attempt sendSeen behind a hard 5s timeout
+        // and never let it block.
         opened = true;
         emit('backfill_chat_opened', { groupId, groupName, attempt });
+        if (list('sendSeen')) {
+          try {
+            await timed('sendSeen', () => Promise.race([
+              activeClient.sendSeen(groupId),
+              new Promise((_, rej) => setTimeout(() => rej(new Error('sendSeen timeout 5s')), 5000)),
+            ]), { attempt });
+          } catch (_) { /* non-fatal — chat is already open */ }
+        }
       } catch (e) {
         lastErr = e;
         emit('backfill_warning', {
@@ -632,6 +660,35 @@ setInterval(() => {
   } catch (_) {}
 }, 500);
 
+// Run a full backfill over the current monitored-groups list. Guarded so that
+// overlapping POST /rescrape (or a rescrape landing while start_monitoring is
+// still going) don't stack multiple concurrent passes over the same groups —
+// which previously fired 3 simultaneous backfills and destroyed each other's
+// CDP context ("Promise was collected"). Each group's backfill takes the page
+// lock so it never overlaps the get_groups scan either.
+function runBackfillBatch(label, startEvent) {
+  if (_backfillInFlight) {
+    emit('backfill_skipped', { label, reason: 'already_in_flight' });
+    process.stderr.write(`[bridge] ${label}: backfill already in flight — skipping\n`);
+    return;
+  }
+  _backfillInFlight = true;
+  (async () => {
+    const rows = await loadMonitoredGroups();
+    emit(startEvent, { groupCount: rows.length });
+    let total = 0;
+    for (const r of rows) {
+      // 1000 messages per group — aggressive backfill to capture history.
+      const n = await withPageLock(() => backfillGroup(r.group_id, r.group_name, 1000));
+      total += n;
+      emit('backfill_progress', { groupName: r.group_name, stored: n });
+    }
+    emit('backfill_complete', { totalStored: total, groups: rows.length });
+  })()
+    .catch(err => emit('error', { message: `${label}: ` + err.message }))
+    .finally(() => { _backfillInFlight = false; });
+}
+
 async function dispatchCmd(cmd) {
   try {
     if (cmd.cmd === 'disconnect') {
@@ -643,33 +700,11 @@ async function dispatchCmd(cmd) {
       }
     } else if (cmd.cmd === 'rescrape') {
       // Re-run the backfill against the current selected_groups list.
-      (async () => {
-        const rows = await loadMonitoredGroups();
-        emit('rescrape_started', { groupCount: rows.length });
-        let total = 0;
-        for (const r of rows) {
-          const n = await backfillGroup(r.group_id, r.group_name, 1000);
-          total += n;
-          emit('backfill_progress', { groupName: r.group_name, stored: n });
-        }
-        emit('backfill_complete', { totalStored: total, groups: rows.length });
-      })().catch(err => emit('error', { message: 'rescrape: ' + err.message }));
+      runBackfillBatch('rescrape', 'rescrape_started');
     } else if (cmd.cmd === 'start_monitoring') {
       // Triggered by the server after the user saves group selection.
       // Reload the selected_groups table and run a backfill for each group.
-      (async () => {
-        const rows = await loadMonitoredGroups();
-        emit('monitoring_started', { groupCount: rows.length });
-        let total = 0;
-        for (const r of rows) {
-          // 1000 messages per group — aggressive backfill to capture history.
-          // loadAndGetAllMessagesInChat handles the actual scroll-load logic.
-          const n = await backfillGroup(r.group_id, r.group_name, 1000);
-          total += n;
-          emit('backfill_progress', { groupName: r.group_name, stored: n });
-        }
-        emit('backfill_complete', { totalStored: total, groups: rows.length });
-      })().catch(err => emit('error', { message: 'start_monitoring: ' + err.message }));
+      runBackfillBatch('start_monitoring', 'monitoring_started');
     } else if (cmd.cmd === 'get_groups') {
       if (!activeClient) {
         // Non-fatal: emitting a top-level 'error' here would tear the client
@@ -697,13 +732,16 @@ async function dispatchCmd(cmd) {
         // hangs past 15s, so its count flaps 0↔N and never stabilizes;
         // listChats({onlyGroups:true}) returns just the groups — far smaller and
         // it settles in seconds.
-        const fetchGroupChats = async () => {
+        const fetchGroupChats = async () => withPageLock(async () => {
           // getAllChats() is the method that actually returns this account's
           // chats on WA Web 2.x — listChats({onlyGroups:true}) came back EMPTY
           // (deploy logs: "first fetch → 0 groups"), and chaining the other
           // methods first just burned a 20s timeout each before reaching
           // getAllChats anyway (the ~60s-per-iteration stall). Call it directly
           // and filter for groups ourselves below.
+          // withPageLock: getAllChats is a heavy CDP sweep over ~500 chats; if
+          // it runs while a backfill is mid-openChat on the same page, one
+          // destroys the other's execution context ("Promise was collected").
           if (typeof activeClient.getAllChats === 'function') {
             try { return (await withTimeout(activeClient.getAllChats(), 25_000)) || []; } catch (_) {}
           }
@@ -711,7 +749,7 @@ async function dispatchCmd(cmd) {
             try { return (await withTimeout(activeClient.listChats(), 25_000)) || []; } catch (_) {}
           }
           return [];
-        };
+        });
 
         const filterGroups = (chats) => chats
           .filter(c =>
