@@ -39,10 +39,18 @@ const STALE_PROCESSING_SEC = parseInt(process.env.PARSE_STALE_PROCESSING_SEC) ||
 const REAP_INTERVAL_MS     = parseInt(process.env.PARSE_REAP_INTERVAL_MS) || 60_000;  // sweep ~1/min
 let lastReapAt = 0;
 
+// Direct-from-Postgres fallback: when Upstash is down (or enqueue silently failed),
+// sweep raw_messages that have no listing yet and process them directly.
+// This makes the parse pipeline work without Upstash at all.
+const DIRECT_POLL_INTERVAL_MS = parseInt(process.env.PARSE_DIRECT_POLL_INTERVAL_MS) || 30_000; // 30s
+const DIRECT_POLL_BATCH       = parseInt(process.env.PARSE_DIRECT_POLL_BATCH) || 10;
+let lastDirectPollAt = 0;
+
 let running = true;
 let processed = 0;
 let failed = 0;
 let dead = 0;
+let consecutiveDequeueErrors = 0;
 
 process.on('SIGTERM', () => { running = false; });
 process.on('SIGINT',  () => { running = false; });
@@ -212,6 +220,42 @@ async function reapStuckJobs() {
                (deadNow ? `, dead-lettered ${deadNow} (attempts exhausted)` : ''));
 }
 
+// Direct Postgres fallback: find raw_messages with no listing and no active/completed
+// parse_job, and process them immediately via processOne() — bypasses Upstash entirely.
+// Called periodically from the main loop so listings are created even when the queue
+// is unreachable. Excludes rows currently being processed or permanently dead-lettered.
+async function processOrphansDirect() {
+  const orphans = await pg.dbAll(
+    `SELECT r.id AS raw_id
+       FROM raw_messages r
+       LEFT JOIN listings  l  ON l.raw_message_id  = r.id
+       LEFT JOIN parse_jobs pj ON pj.raw_message_id = r.id
+      WHERE l.id IS NULL
+        AND (pj.id IS NULL OR pj.status NOT IN ('processing', 'done', 'dead'))
+      ORDER BY r.ts_received DESC
+      LIMIT $1`,
+    [DIRECT_POLL_BATCH]
+  );
+  if (!orphans.length) return 0;
+
+  console.log(`[parseWorker] direct-poll: found ${orphans.length} orphaned message(s) — processing directly`);
+  let count = 0;
+  for (const r of orphans) {
+    if (!running) break;
+    try {
+      await processOne({ raw_id: r.raw_id });
+      count++;
+      await sleep(POLL_INTERVAL_MS); // honour Groq rate-limit between calls
+    } catch (err) {
+      console.warn(`[parseWorker] direct-poll error for raw_id=${r.raw_id}:`, err.message);
+    }
+  }
+  if (count > 0) {
+    console.log(`[parseWorker] direct-poll: done — processed ${count}/${orphans.length}`);
+  }
+  return count;
+}
+
 // Startup recovery: re-enqueue any raw_messages that never made it into
 // `listings` AND aren't already tracked in parse_jobs (pending/processing/done).
 // Handles two failure modes:
@@ -275,14 +319,35 @@ async function loop() {
       catch (e) { console.warn('[parseWorker] reaper error:', e.message); }
     }
 
+    // Postgres-direct fallback — process orphaned raw_messages even when
+    // Upstash is unreachable. Fires immediately on first iteration
+    // (lastDirectPollAt starts at 0) and then every DIRECT_POLL_INTERVAL_MS.
+    if (Date.now() - lastDirectPollAt > DIRECT_POLL_INTERVAL_MS) {
+      lastDirectPollAt = Date.now();
+      try { await processOrphansDirect(); }
+      catch (e) { console.warn('[parseWorker] direct-poll error:', e.message); }
+    }
+
     let job = null;
     try {
       // BRPOP blocks up to 5s waiting for work — replaces the rpop + sleep
       // polling pattern that burned ~720 REST calls/hour on an empty queue.
       job = await queue.dequeueBlocking(PARSE_QUEUE, 5);
+      consecutiveDequeueErrors = 0; // reset on any successful round-trip
     } catch (err) {
-      console.warn('[parseWorker] dequeue error:', err.message);
-      await sleep(IDLE_BACKOFF_MS);
+      consecutiveDequeueErrors++;
+      // Exponential backoff (5s → 10s → 20s → … capped at 2 min) so the
+      // log isn't flooded when Upstash is persistently unreachable.
+      // The direct-poll above handles actual processing in the meantime.
+      const backoff = Math.min(
+        IDLE_BACKOFF_MS * Math.pow(2, Math.min(consecutiveDequeueErrors - 1, 5)),
+        120_000
+      );
+      // Log the first 3 errors, then only every 10th to avoid spam.
+      if (consecutiveDequeueErrors <= 3 || consecutiveDequeueErrors % 10 === 0) {
+        console.warn(`[parseWorker] dequeue error #${consecutiveDequeueErrors} (backoff ${backoff}ms): ${err.message}`);
+      }
+      await sleep(backoff);
       continue;
     }
 
