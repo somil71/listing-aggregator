@@ -660,6 +660,32 @@ setInterval(() => {
   } catch (_) {}
 }, 500);
 
+// A freshly (re)linked multi-device session streams group history
+// asynchronously — the phone pushes each chat's backlog over the next 30–90s.
+// Because initiate-qr now force-cleans the Chromium profile (to avoid "could
+// not link device"), every manual connect is a brand-new link, so the first
+// backfill pass routinely fires BEFORE any history has arrived and harvests 0.
+// We re-harvest the groups that came back empty once, after this delay, by
+// which point the backlog has normally landed. Persistence is idempotent
+// (INSERT OR IGNORE on SQLite, ON CONFLICT DO NOTHING on Postgres), so a retry
+// can only fill gaps — it can never duplicate a message.
+const BACKFILL_RETRY_DELAY_MS = parseInt(process.env.BACKFILL_RETRY_DELAY_MS) || 60_000;
+
+// Backfill a list of {group_id, group_name} rows. Returns the total stored and
+// the subset of rows that harvested nothing (candidates for a delayed retry).
+async function backfillGroups(rows, { retry = false } = {}) {
+  let total = 0;
+  const empty = [];
+  for (const r of rows) {
+    // 1000 messages per group — aggressive backfill to capture history.
+    const n = await withPageLock(() => backfillGroup(r.group_id, r.group_name, 1000));
+    total += n;
+    if (n === 0) empty.push(r);
+    emit('backfill_progress', { groupName: r.group_name, stored: n, retry });
+  }
+  return { total, empty };
+}
+
 // Run a full backfill over the current monitored-groups list. Guarded so that
 // overlapping POST /rescrape (or a rescrape landing while start_monitoring is
 // still going) don't stack multiple concurrent passes over the same groups —
@@ -676,14 +702,24 @@ function runBackfillBatch(label, startEvent) {
   (async () => {
     const rows = await loadMonitoredGroups();
     emit(startEvent, { groupCount: rows.length });
-    let total = 0;
-    for (const r of rows) {
-      // 1000 messages per group — aggressive backfill to capture history.
-      const n = await withPageLock(() => backfillGroup(r.group_id, r.group_name, 1000));
-      total += n;
-      emit('backfill_progress', { groupName: r.group_name, stored: n });
-    }
+    const { total, empty } = await backfillGroups(rows);
     emit('backfill_complete', { totalStored: total, groups: rows.length });
+
+    // Retry the groups that harvested 0 — the backlog likely just hadn't synced
+    // yet on this fresh link. Hold the in-flight lock across the wait so a
+    // concurrent rescrape is de-duped rather than racing us. Bail if the client
+    // dropped in the meantime (nothing to harvest from a dead page).
+    if (empty.length > 0) {
+      emit('backfill_retry_scheduled', { groups: empty.length, delayMs: BACKFILL_RETRY_DELAY_MS });
+      process.stderr.write(`[bridge] ${label}: ${empty.length} group(s) empty — retrying in ${BACKFILL_RETRY_DELAY_MS}ms\n`);
+      await new Promise(r => setTimeout(r, BACKFILL_RETRY_DELAY_MS));
+      if (!activeClient) {
+        emit('backfill_warning', { reason: 'retry_skipped', message: 'client disconnected before retry' });
+        return;
+      }
+      const { total: retryTotal } = await backfillGroups(empty, { retry: true });
+      emit('backfill_complete', { totalStored: retryTotal, groups: empty.length, retry: true });
+    }
   })()
     .catch(err => emit('error', { message: `${label}: ` + err.message }))
     .finally(() => { _backfillInFlight = false; });
