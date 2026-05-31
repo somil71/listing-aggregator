@@ -443,12 +443,31 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
   if (list('getAllMessagesInChat')) {
     emit('backfill_step', { groupName, step: '0b_sync_start' });
     let prev = -1, stable = 0;
+    // 10s cap per peek: for large groups getAllMessagesInChat serialises thousands of
+    // message objects over CDP and can block for the full 5-minute protocolTimeout.
+    // A slow peek means the WA store is already populated; break immediately and let
+    // Step 2 harvest whatever is there — no need to wait for stability.
+    const PEEK_TIMEOUT_MS = 10_000;
     for (let i = 0; i < 30 && stable < 4; i++) {
       const t0 = Date.now();
-      const peek = await activeClient.getAllMessagesInChat(groupId, true, false).catch((e) => {
-        emit('cdp_fail', { groupName, label: 'getAllMessagesInChat(sync)', iter: i, ms: Date.now() - t0, error: e.message });
-        return [];
-      });
+      let peek;
+      try {
+        peek = await Promise.race([
+          activeClient.getAllMessagesInChat(groupId, true, false),
+          new Promise((_, rej) =>
+            setTimeout(() => rej(new Error('peek_timeout')), PEEK_TIMEOUT_MS)),
+        ]);
+      } catch (e) {
+        const ms = Date.now() - t0;
+        if (e.message === 'peek_timeout') {
+          // Large group: slow getAllMessagesInChat == store is already populated.
+          // Exit the sync-wait loop so we don't burn 25+ minutes here.
+          emit('backfill_step', { groupName, step: '0b_peek_timeout', iter: i, ms });
+          break;
+        }
+        emit('cdp_fail', { groupName, label: 'getAllMessagesInChat(sync)', iter: i, ms, error: e.message });
+        peek = [];
+      }
       const ms = Date.now() - t0;
       // Only log slow peeks (>3s) or the first iteration — avoid flooding logs.
       if (i === 0 || ms > 3000) {
@@ -469,6 +488,9 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
       emit('backfill_step', { groupName, step: '1_scroll_start' });
       let stable = 0;
       let lastCount = -1;
+      // After a peek timeout we skip all subsequent peeks; stability falls back to
+      // loadEarlierMessages returning [] (which means "no more history to load").
+      let skipScrollPeek = false;
       for (let i = 0; i < 50 && stable < 4; i++) {
         const t0 = Date.now();
         try {
@@ -487,16 +509,28 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
           // some chats reject when at top; treat as "no more"
           stable++;
         }
-        // peek at total count so far
-        if (list('getAllMessagesInChat')) {
+        // peek at total count so far — capped at 10s to avoid hanging on large groups.
+        // After a single timeout, skip all remaining peeks; stability is tracked via
+        // loadEarlierMessages returning [] above.
+        if (!skipScrollPeek && list('getAllMessagesInChat')) {
           const tp = Date.now();
-          const peek = await activeClient.getAllMessagesInChat(groupId, true, false).catch((e) => {
-            emit('cdp_fail', { groupName, label: 'getAllMessagesInChat(scroll)', iter: i, ms: Date.now() - tp, error: e.message });
-            return [];
-          });
-          if (peek.length === lastCount) stable++; else stable = 0;
-          lastCount = peek.length;
-          if (peek.length >= targetCount) break;
+          try {
+            const peek = await Promise.race([
+              activeClient.getAllMessagesInChat(groupId, true, false),
+              new Promise((_, rej) =>
+                setTimeout(() => rej(new Error('peek_timeout')), 10_000)),
+            ]);
+            if (peek.length === lastCount) stable++; else stable = 0;
+            lastCount = peek.length;
+            if (peek.length >= targetCount) break;
+          } catch (e) {
+            if (e.message === 'peek_timeout') {
+              skipScrollPeek = true;
+              emit('backfill_step', { groupName, step: '1_peek_disabled', iter: i, ms: Date.now() - tp });
+            } else {
+              emit('cdp_fail', { groupName, label: 'getAllMessagesInChat(scroll)', iter: i, ms: Date.now() - tp, error: e.message });
+            }
+          }
         }
       }
       emit('backfill_scrolled', { groupName, attempts: 50, finalCount: lastCount });
