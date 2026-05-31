@@ -138,9 +138,31 @@ class WhatsAppService {
 
   registerSSE(userId, res) {
     this.sseConnections.set(userId, res);
-    // Replay last known state so a slow-connecting client catches up
+    // Replay last known state so a slow-connecting client catches up.
+    // Exception: skip replaying a stale `disconnected` event when no bridge
+    // is currently running for this user — it would immediately push the
+    // client into the error phase even though this is a fresh QR-connect
+    // attempt (e.g. after the previous QR timed out and the user clicked
+    // "Try Again").
     const last = this.lastState.get(userId);
-    if (last) this._emit(userId, last.event, last.data);
+    if (last && !(last.event === 'disconnected' && !this.clients.has(userId))) {
+      this._emit(userId, last.event, last.data);
+    }
+
+    // Keep the SSE connection alive through Railway / nginx proxy idle timeouts.
+    // The QR code takes 5–12 s to generate; without a heartbeat the proxy can
+    // silently close the stream before qr_generated ever fires, so the client
+    // never sees the QR image.  SSE comment lines (":\n\n") are invisible to
+    // the browser EventSource but reset the proxy's idle timer.
+    this._heartbeats = this._heartbeats || new Map();
+    const existingHb = this._heartbeats.get(userId);
+    if (existingHb) clearInterval(existingHb);
+    const hb = setInterval(() => {
+      const r = this.sseConnections.get(userId);
+      if (!r) { clearInterval(hb); this._heartbeats?.delete(userId); return; }
+      try { r.write(': ping\n\n'); } catch (_) { clearInterval(hb); this._heartbeats?.delete(userId); }
+    }, 8000);
+    this._heartbeats.set(userId, hb);
 
     // If we're not the instance that owns the bridge, subscribe to the
     // distributed bus so we still see events for this user.  When this
@@ -166,6 +188,9 @@ class WhatsAppService {
 
   removeSSE(userId) {
     this.sseConnections.delete(userId);
+    // Clear the heartbeat timer so it doesn't keep firing after disconnect
+    const hb = this._heartbeats?.get(userId);
+    if (hb) { clearInterval(hb); this._heartbeats.delete(userId); }
     const unsub = this._busSubs?.get(userId);
     if (unsub) {
       try { unsub(); } catch (_) {}
@@ -392,8 +417,12 @@ class WhatsAppService {
     if (type === 'qr') {
       // wppconnect ships a ready-to-use data URL; fall back to generating one
       // ourselves if only the raw QR string is provided (older bridge versions).
-      const image = data.image || (data.qr ? await QRCode.toDataURL(data.qr) : null);
+      let image = data.image || (data.qr ? await QRCode.toDataURL(data.qr) : null);
       if (!image) return;
+      // Normalize: some wppconnect builds emit raw base64 without the data-URL
+      // prefix, which makes <img src={image}> silently render nothing.
+      if (!image.startsWith('data:')) image = `data:image/png;base64,${image}`;
+      console.log(`[whatsapp] qr for ${userId}: prefix=${image.slice(0, 30)}… len=${image.length} sseOpen=${this.sseConnections.has(userId)}`);
       this._emit(userId, 'qr_generated', { image, message: 'Scan with your phone' });
       await dbRun(
         `INSERT OR REPLACE INTO whatsapp_sessions (id, user_id, status, updated_at)
