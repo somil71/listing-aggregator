@@ -4,12 +4,47 @@
 require('dotenv').config();
 const { Redis } = require('@upstash/redis');
 
+// Values copied from the Upstash console's "REST" tab arrive as
+// `UPSTASH_REDIS_REST_URL="https://..."` — quotes included. If that whole
+// string (quotes and all) is pasted into a Railway/host variable, the SDK
+// fetches `"https://...` and every call dies with a bare, undiagnosable
+// `fetch failed`. Trim surrounding whitespace/newlines and strip one layer of
+// matching quotes so a copy-paste with quotes can't silently break the queue.
+function cleanEnv(v) {
+  if (!v) return v;
+  let s = String(v).trim();
+  if (
+    s.length >= 2 &&
+    ((s[0] === '"' && s[s.length - 1] === '"') ||
+      (s[0] === "'" && s[s.length - 1] === "'"))
+  ) {
+    s = s.slice(1, -1).trim();
+  }
+  return s;
+}
+
+const REST_URL = cleanEnv(process.env.UPSTASH_REDIS_REST_URL);
+const REST_TOKEN = cleanEnv(process.env.UPSTASH_REDIS_REST_TOKEN);
+
 let client = null;
-if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
-  client = new Redis({
-    url: process.env.UPSTASH_REDIS_REST_URL,
-    token: process.env.UPSTASH_REDIS_REST_TOKEN,
-  });
+if (REST_URL && REST_TOKEN) {
+  client = new Redis({ url: REST_URL, token: REST_TOKEN });
+  // One-time boot connectivity probe. Turns the worker's cryptic, repeating
+  // "dequeue error: fetch failed" into a single actionable line at startup and
+  // confirms the queue is actually reachable. Fire-and-forget — never blocks
+  // boot, and a failure here is non-fatal because parseWorker falls back to the
+  // Postgres direct-poll. The token is never logged; the URL is not a secret.
+  client
+    .ping()
+    .then(() => console.log(`[upstash] connected — ${REST_URL}`))
+    .catch((err) =>
+      console.error(
+        `[upstash] PING failed (${err?.message || err}). Queue unreachable — ` +
+          'parseWorker will fall back to Postgres direct-poll. Verify ' +
+          'UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN on this service ' +
+          '(no surrounding quotes, no trailing newline).'
+      )
+    );
 } else {
   console.warn('[upstash] UPSTASH_REDIS_REST_URL/TOKEN not set — queue disabled');
 }
