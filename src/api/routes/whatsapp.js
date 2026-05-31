@@ -37,15 +37,30 @@ router.post('/sse-token', authenticate, async (req, res) => {
 // the Clerk JWT never appears in URLs, browser history, or server logs.
 router.get('/qr-stream', authenticateSSE, (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
+  // 'no-transform' stops intermediary proxies from buffering/compressing the stream.
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  // NOTE: do NOT set `Connection: keep-alive`. It is a hop-by-hop header that is
+  // explicitly forbidden under HTTP/2 (RFC 7540 §8.1.2.2). Railway terminates the
+  // client connection with HTTP/2, and forwarding this header from our HTTP/1.1
+  // upstream made its edge proxy reject the stream as malformed —
+  // ERR_HTTP2_PROTOCOL_ERROR on the browser, with intermittent 500s. HTTP/1.1
+  // keep-alive is the transport default anyway, so omitting it changes nothing
+  // for direct/local connections.
   res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering
   res.flushHeaders();
 
   // Immediate ping so the client knows the channel is open
   res.write('event: connected\ndata: {}\n\n');
 
-  whatsappService.registerSSE(req.userId, res);
+  // registerSSE replays last-known state and wires the heartbeat. Headers are
+  // already flushed (status 200 sent), so a throw here cannot become a clean
+  // HTTP error — it would half-open the stream. Contain it so the connection
+  // stays usable and the failure is logged instead of crashing the handler.
+  try {
+    whatsappService.registerSSE(req.userId, res);
+  } catch (err) {
+    console.error('[whatsapp] registerSSE failed:', err?.message ?? err);
+  }
   req.on('close', () => whatsappService.removeSSE(req.userId));
 });
 
