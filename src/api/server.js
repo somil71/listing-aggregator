@@ -1449,6 +1449,21 @@ async function startServer() {
         logger.warn('autoResumeBridges failed', { error: err.message })
       );
     }, 3000).unref();
+
+    // Start the parse worker in-process so listings are created without a
+    // separate Railway service.  The worker's SIGTERM handler already sets
+    // running=false when the process is signalled, so it drains gracefully
+    // alongside the HTTP server.  We skip pg.close() inside the worker when
+    // embedded — the server's shutdown handler closes the shared pool.
+    setTimeout(() => {
+      try {
+        const { startWorker } = require('../worker/parseWorker');
+        startWorker();
+        logger.info('[parseWorker] started in-process');
+      } catch (err) {
+        logger.warn('[parseWorker] failed to start in-process', { error: err.message });
+      }
+    }, 5000).unref();
   } catch (err) {
     logger.error('Server failed to start', { error: err.message, stack: err.stack });
     process.exit(1);

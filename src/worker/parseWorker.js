@@ -212,7 +212,60 @@ async function reapStuckJobs() {
                (deadNow ? `, dead-lettered ${deadNow} (attempts exhausted)` : ''));
 }
 
+// Startup recovery: re-enqueue any raw_messages that never made it into
+// `listings` AND aren't already tracked in parse_jobs (pending/processing/done).
+// Handles two failure modes:
+//   1. Upstash was not configured → jobs were never enqueued on the write path.
+//   2. Jobs were enqueued but the queue was flushed / redis data was lost.
+// Runs once on startup, capped at 500 rows to avoid flooding Groq on first boot.
+// Uses the same payload shape as writeRawMessage so the worker processes them
+// identically to freshly-written messages.
+const STARTUP_RECOVERY_LIMIT = parseInt(process.env.PARSE_STARTUP_RECOVERY_LIMIT) || 500;
+
+async function recoverOrphanedMessages() {
+  let count = 0;
+  try {
+    // Only join listings (the authoritative output). Skip parse_jobs to avoid
+    // a hard dependency on that table existing — recovery is a nice-to-have,
+    // not a boot-blocker. Re-enqueueing a row that is mid-flight is safe because
+    // processOne uses ON CONFLICT DO UPDATE (idempotent).
+    const orphans = await pg.dbAll(
+      `SELECT r.id AS raw_id, r.text, r.sender_name, r.wa_group_id,
+              r.ts_received, mg.group_name
+         FROM raw_messages r
+         LEFT JOIN listings l ON l.raw_message_id = r.id
+         LEFT JOIN monitored_groups mg
+           ON mg.user_id = r.user_id AND mg.wa_group_id = r.wa_group_id
+        WHERE l.id IS NULL
+        ORDER BY r.ts_received DESC
+        LIMIT $1`,
+      [STARTUP_RECOVERY_LIMIT]
+    );
+    for (const r of orphans) {
+      await queue.enqueue(PARSE_QUEUE, {
+        raw_id:      r.raw_id,
+        text:        r.text,
+        sender_name: r.sender_name,
+        wa_group_id: r.wa_group_id,
+        group_name:  r.group_name,
+        ts_received: r.ts_received,
+      });
+      count++;
+    }
+    if (count > 0) {
+      console.log(`[parseWorker] startup recovery: re-enqueued ${count} orphaned raw_message(s)`);
+    }
+  } catch (err) {
+    console.warn('[parseWorker] startup recovery error (non-fatal):', err.message);
+  }
+  return count;
+}
+
 async function loop() {
+  // Recover any raw_messages that exist in Postgres but never made it into
+  // listings (missed enqueue, lost queue, first-boot without Upstash, etc.).
+  await recoverOrphanedMessages();
+
   while (running) {
     // Periodic sweep for jobs orphaned by a crashed worker. Runs even on an idle
     // queue (BRPOP returns null every 5s) so recovery doesn't wait for traffic.
@@ -296,12 +349,28 @@ async function loop() {
   }
 
   console.log(`[parseWorker] shutting down. processed=${processed} failed=${failed} dead=${dead}`);
-  await pg.close().catch(() => {});
+  // Only close the pool when running standalone — when embedded inside the
+  // API server the pool is shared; let server.js own the lifecycle.
+  if (require.main === module) await pg.close().catch(() => {});
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-loop().catch(err => {
-  console.error('[parseWorker] fatal:', err);
-  process.exit(1);
-});
+// ── Entry points ─────────────────────────────────────────────────────────────
+// When run as the main script: start immediately and crash on fatal error.
+// When required by server.js (in-process): export startWorker() so the caller
+// controls startup timing.  The SIGTERM/SIGINT handlers above still fire in
+// both cases, setting running=false so the loop drains gracefully.
+function startWorker() {
+  loop().catch(err => {
+    console.error('[parseWorker] fatal:', err);
+    // Only hard-exit when standalone — embedded in server.js a crash is a
+    // worker bug and the server should keep serving HTTP requests.
+    if (require.main === module) process.exit(1);
+    else console.error('[parseWorker] worker stopped; server continues');
+  });
+}
+
+module.exports = { startWorker };
+
+if (require.main === module) startWorker();
