@@ -356,6 +356,11 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
   // store which is already populated by the multi-device history sync, so
   // recent messages (last 24-72 h) are captured even without openChat.
   let openChatSucceeded = false;
+  // Set to true when the Step-0b peek times out — indicates the WA store already
+  // holds so many messages that getAllMessagesInChat will also timeout (it serialises
+  // everything). Used below to skip the two heavy harvest fallbacks and go straight
+  // to getMessages({ count: targetCount }) which is bounded and always fast.
+  let groupIsLarge = false;
   if (list('openChat')) {
     // openChat occasionally rejects with a transient Puppeteer error or CDP
     // timeout. Retry a small number of times with a short per-attempt timeout
@@ -460,8 +465,10 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
       } catch (e) {
         const ms = Date.now() - t0;
         if (e.message === 'peek_timeout') {
-          // Large group: slow getAllMessagesInChat == store is already populated.
-          // Exit the sync-wait loop so we don't burn 25+ minutes here.
+          // Large group: slow getAllMessagesInChat == store is already populated AND
+          // the harvest's getAllMessages* calls will also timeout. Flag it so Step 2
+          // skips the two unbounded methods and goes straight to getMessages.
+          groupIsLarge = true;
           emit('backfill_step', { groupName, step: '0b_peek_timeout', iter: i, ms });
           break;
         }
@@ -541,9 +548,13 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
     emit('backfill_warning', { groupName, reason: 'scroll_failed', message: e.message });
   }
 
-  // Step 2: harvest everything that's now loaded
-  emit('backfill_step', { groupName, step: '2_harvest_start' });
-  if (list('getAllMessagesInChat')) {
+  // Step 2: harvest everything that's now loaded.
+  // getAllMessagesInChat / loadAndGetAllMessagesInChat serialise the ENTIRE WA store
+  // for the group — fast for small groups, but for large groups they hit the 5-min
+  // protocolTimeout.  Skip them when groupIsLarge and fall straight through to
+  // getMessages({ count: targetCount }) which is bounded and always completes quickly.
+  emit('backfill_step', { groupName, step: '2_harvest_start', groupIsLarge });
+  if (!groupIsLarge && list('getAllMessagesInChat')) {
     try {
       messages = await timed('getAllMessagesInChat(harvest)', () => activeClient.getAllMessagesInChat(groupId, true, false));
       emit('backfill_loaded', { groupName, method: 'getAllMessagesInChat', count: messages.length });
@@ -552,7 +563,7 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
     }
   }
 
-  if (messages.length === 0 && list('loadAndGetAllMessagesInChat')) {
+  if (!groupIsLarge && messages.length === 0 && list('loadAndGetAllMessagesInChat')) {
     try {
       messages = await timed('loadAndGetAllMessagesInChat(harvest)', () => activeClient.loadAndGetAllMessagesInChat(groupId, true, false));
       emit('backfill_loaded', { groupName, method: 'loadAndGetAllMessagesInChat', count: messages.length });
