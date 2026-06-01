@@ -574,8 +574,15 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
 
   if (messages.length === 0 && list('getMessages')) {
     try {
-      messages = await timed('getMessages(harvest)', () => activeClient.getMessages(groupId, { count: targetCount, direction: 'before' }));
-      emit('backfill_loaded', { groupName, method: 'getMessages', count: messages.length });
+      // Large groups have thousands of messages loaded in the WA Web JS store.
+      // getMessages still serialises each result object over CDP, so count:1000
+      // routinely hits the 300 s protocolTimeout.  Use a much smaller count for
+      // large groups to stay within the budget — 100 recent messages is plenty
+      // to seed the dashboard while keeping CDP round-trip time well under 30 s.
+      const harvestCount = groupIsLarge ? 100 : targetCount;
+      messages = await timed('getMessages(harvest)', () =>
+        activeClient.getMessages(groupId, { count: harvestCount, direction: 'before' }));
+      emit('backfill_loaded', { groupName, method: 'getMessages', count: messages.length, harvestCount });
     } catch (_) {}
   }
 
