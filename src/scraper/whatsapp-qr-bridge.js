@@ -427,10 +427,19 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
       // so it is skipped. But getAllMessagesInChat (Step 2) reads from the
       // in-memory WA store which is populated by multi-device history sync,
       // so recent messages are still harvested below.
+      //
+      // A group that refuses to open is definitionally heavy: its JS store is
+      // either empty (openChat never loaded it) or so large that openChat itself
+      // times out.  In either case the Step 0b getAllMessagesInChat peek will
+      // return instantly (empty store → no data to serialise → no 10 s timeout),
+      // so the 0b_peek_timeout branch that normally sets groupIsLarge will never
+      // fire.  We must set it here so getMessages(harvest) uses count:100 instead
+      // of count:1000 and stays well inside the 300 s CDP protocolTimeout.
+      groupIsLarge = true;
       emit('backfill_warning', {
         groupId, groupName, reason: 'open_failed_continuing',
         message: lastErr ? lastErr.message : 'unknown',
-        note: 'Falling through to direct store harvest — Steps 0b and 2 still run',
+        note: 'Falling through to direct store harvest — Steps 0b and 2 still run; groupIsLarge forced true',
       });
       // DO NOT return 0 — fall through to Steps 0b and 2 below.
     }
