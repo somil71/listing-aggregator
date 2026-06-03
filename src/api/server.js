@@ -182,6 +182,9 @@ async function runPostgresMigrations() {
 // server, because the primary data store is Postgres (see src/db/postgres/).
 async function runMigrations() {
   const migrationFiles = [
+    // Base schema MUST run first — creates raw_messages and listings tables.
+    // Uses IF NOT EXISTS so it is idempotent on existing databases.
+    '../db/schema.sql',
     '../db/migrations/addUsersTables.sql',
     '../db/migrations/addAuditLog.sql',
     '../db/migrations/addFTS5.sql',

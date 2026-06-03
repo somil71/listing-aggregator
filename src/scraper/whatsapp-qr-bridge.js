@@ -597,11 +597,60 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
 
   emit('backfill_step', { groupName, step: '3_persist_start', toPersist: Math.min(messages.length, targetCount) });
 
+  // Message-format probe: log the first message's top-level keys and a few
+  // critical fields.  This fires once per backfill and tells us immediately:
+  //   (a) whether wppconnect returned the expected shape, and
+  //   (b) whether body/isMedia/hasMedia are set — the two fields that gate
+  //       persistMessage's early-return check.
+  if (messages.length > 0) {
+    const sample = messages[messages.length - 1]; // most-recent
+    emit('backfill_msg_sample', {
+      groupName,
+      keys: Object.keys(sample).slice(0, 30),
+      type: sample.type,
+      bodyLen: typeof sample.body === 'string' ? sample.body.length : sample.body,
+      isMedia: sample.isMedia,
+      hasMedia: sample.hasMedia,
+      hasId: !!sample.id,
+      hasT: !!sample.t,
+    });
+  }
+
   // Persist (most recent N up to targetCount, but oldest-first so chronology is preserved in DB)
   messages = messages.slice(-targetCount);
   let stored = 0;
+  let persistErrors = 0;
+  let persistSkipped = 0;
   for (const m of messages) {
-    try { await persistMessage(m, groupName); stored++; } catch (_) {}
+    try {
+      // persistMessage returns early (undefined) for messages with no body and
+      // no media — these are system notifications / reactions / etc.  We track
+      // them separately so a log of "stored:0" doesn't hide "fetched:100".
+      const result = await persistMessage(m, groupName);
+      if (result === undefined && !m.body && !m.isMedia) {
+        persistSkipped++;
+      } else {
+        stored++;
+      }
+    } catch (err) {
+      persistErrors++;
+      // Emit the FIRST per-group persist failure verbatim so we can see exactly
+      // which DB error is silently killing every store attempt (e.g. "no such
+      // table: raw_messages" on a fresh container, or a schema mismatch).
+      if (persistErrors <= 3) {
+        emit('persist_error', {
+          groupName,
+          error: err.message,
+          msgType: m.type,
+          msgBodyLen: typeof m.body === 'string' ? m.body.length : String(m.body),
+          nth: persistErrors,
+        });
+        process.stderr.write(`[bridge] persist_error (${groupName}): ${err.message}\n`);
+      }
+    }
+  }
+  if (persistErrors > 0 || persistSkipped > 0) {
+    emit('backfill_persist_summary', { groupName, stored, persistErrors, persistSkipped, total: messages.length });
   }
   return stored;
 }
