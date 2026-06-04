@@ -634,25 +634,35 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
     }
   }
 
+  // Ensure messages is always a plain array before we call .length or .slice.
+  // Harvest methods (getAllMessagesInChat, getMessages) should return arrays,
+  // but a version mismatch in wppconnect could return undefined or an object.
+  // Coercing here prevents .slice() crashing outside of any try/catch below.
+  if (!Array.isArray(messages)) messages = [];
+
   emit('backfill_step', { groupName, step: '3_persist_start', toPersist: Math.min(messages.length, targetCount) });
 
-  // Message-format probe: log the first message's top-level keys and a few
+  // Message-format probe: log the last message's top-level keys and a few
   // critical fields.  This fires once per backfill and tells us immediately:
   //   (a) whether wppconnect returned the expected shape, and
   //   (b) whether body/isMedia/hasMedia are set — the two fields that gate
   //       persistMessage's early-return check.
   if (messages.length > 0) {
-    const sample = messages[messages.length - 1]; // most-recent
-    emit('backfill_msg_sample', {
-      groupName,
-      keys: Object.keys(sample).slice(0, 30),
-      type: sample.type,
-      bodyLen: typeof sample.body === 'string' ? sample.body.length : sample.body,
-      isMedia: sample.isMedia,
-      hasMedia: sample.hasMedia,
-      hasId: !!sample.id,
-      hasT: !!sample.t,
-    });
+    // Find the last non-null message for the sample — wppconnect's
+    // processMessageObj can return null for corrupt WA store entries.
+    const sample = [...messages].reverse().find(m => m != null);
+    if (sample) {
+      emit('backfill_msg_sample', {
+        groupName,
+        keys: Object.keys(sample).slice(0, 30),
+        type: sample.type,
+        bodyLen: typeof sample.body === 'string' ? sample.body.length : sample.body,
+        isMedia: sample.isMedia,
+        hasMedia: sample.hasMedia,
+        hasId: !!sample.id,
+        hasT: !!sample.t,
+      });
+    }
   }
 
   // Persist (most recent N up to targetCount, but oldest-first so chronology is preserved in DB)
@@ -661,6 +671,10 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
   let persistErrors = 0;
   let persistSkipped = 0;
   for (const m of messages) {
+    // Guard: processMessageObj can return null/undefined for corrupt WA store
+    // entries. Without this check, m.body throws TypeError and every message
+    // in the batch is counted as a persistError, giving 0 stored with no clue why.
+    if (m == null) { persistSkipped++; continue; }
     try {
       // persistMessage returns early (no-op) for messages with no body and no
       // media — system notifications, reactions, group-join alerts, etc.
@@ -734,6 +748,23 @@ const wppconnectConfig = {
 
 emit('debug_config', { config: { ...wppconnectConfig, puppeteerOptions: '[puppeteerOptions]' } });
 
+// Hard timeout on wppconnect.create(): if WA Web never finishes loading
+// (servers unreachable, network partition, page hung at "Loading…") the
+// promise never resolves or rejects and the bridge is permanently stuck.
+// autoClose:300000 only fires when a QR is shown; it does NOT cover the case
+// where Chrome starts and the WA page hangs before showing the QR at all.
+// 10 minutes is generous — a healthy session resolves in under 30 s.
+const CREATE_TIMEOUT_MS = parseInt(process.env.WPP_CREATE_TIMEOUT_MS) || 10 * 60 * 1000;
+const _createTimeout = setTimeout(() => {
+  emit('backfill_warning', {
+    reason: 'create_timeout',
+    message: `wppconnect.create() did not resolve in ${CREATE_TIMEOUT_MS / 1000}s — exiting so auto-resume can retry`,
+  });
+  process.stderr.write(`[bridge] wppconnect.create() timeout after ${CREATE_TIMEOUT_MS}ms — exiting\n`);
+  setTimeout(() => process.exit(1), 200);
+}, CREATE_TIMEOUT_MS);
+_createTimeout.unref(); // don't prevent normal exit if create() resolves first
+
 wppconnect
   .create({
     ...wppconnectConfig,
@@ -763,22 +794,43 @@ wppconnect
     },
   })
   .then(async (client) => {
+    // create() resolved — cancel the hang-guard so it doesn't fire later.
+    clearTimeout(_createTimeout);
+
     // This runs only after a full login (either fresh QR scan or restored session).
-    activeClient = client;
-    const phone = (await client.getHostDevice().catch(() => null))?.id?.user || null;
-    emit('ready', { phone });
+    // Wrap the entire body so an unexpected throw (e.g. wireMessageListener or
+    // loadMonitoredGroups blowing up) does NOT propagate to the outer .catch()
+    // and kill the bridge.  We log the error and keep going — the bridge is
+    // alive and can still receive commands even if boot-time setup partially fails.
+    try {
+      activeClient = client;
+      const phone = (await client.getHostDevice().catch(() => null))?.id?.user || null;
+      emit('ready', { phone });
 
-    // Wire the message listener immediately so we don't miss any incoming
-    // messages even before the user explicitly selects groups.  The handler
-    // filters against monitoredGroupIds which starts empty (so nothing is
-    // stored until start_monitoring is called).
-    wireMessageListener();
+      // Wire the message listener immediately so we don't miss any incoming
+      // messages even before the user explicitly selects groups.  The handler
+      // filters against monitoredGroupIds which starts empty (so nothing is
+      // stored until start_monitoring is called).
+      wireMessageListener();
 
-    // If the user already has selected groups from a previous session, start
-    // monitoring them right away.
-    await loadMonitoredGroups();
+      // If the user already has selected groups from a previous session, start
+      // monitoring them right away.
+      await loadMonitoredGroups();
+    } catch (bootErr) {
+      // Non-fatal: emit a warning so the error is visible in logs without
+      // killing the bridge (which would orphan Chromium).
+      emit('backfill_warning', {
+        reason: 'boot_error',
+        message: bootErr.message,
+        stack: (bootErr.stack || '').split('\n').slice(0, 3).join(' | '),
+      });
+      process.stderr.write(`[bridge] boot error (non-fatal): ${bootErr.message}\n`);
+    }
   })
   .catch((err) => {
+    clearTimeout(_createTimeout);
+    // Only reaches here when wppconnect.create() itself rejects — i.e. Chrome
+    // failed to start or WA login failed entirely. This IS fatal for the bridge.
     emit('error', {
       message: err?.message || String(err),
       stack: err?.stack?.split('\n').slice(0, 5).join(' | '),
