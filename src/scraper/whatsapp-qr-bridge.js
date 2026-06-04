@@ -131,7 +131,9 @@ function getDualWrite() {
 }
 
 async function persistMessage(message, groupName) {
-  if (!message.body && !message.isMedia) return;
+  // isMedia = whatsapp-web.js field; hasMedia = wppconnect field.  Accept either
+  // so backfill messages (wppconnect) and live messages (onMessage) both pass.
+  if (!message.body && !message.isMedia && !message.hasMedia) return;
 
   const messageId = message.id?._serialized || message.id || `${Date.now()}-${Math.random()}`;
   const ts = message.t ? new Date(message.t * 1000).toISOString() : new Date().toISOString();
@@ -592,7 +594,9 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
       messages = await timed('getMessages(harvest)', () =>
         activeClient.getMessages(groupId, { count: harvestCount, direction: 'before' }));
       emit('backfill_loaded', { groupName, method: 'getMessages', count: messages.length, harvestCount });
-    } catch (_) {}
+    } catch (e) {
+      emit('backfill_warning', { groupName, reason: 'harvest_failed', method: 'getMessages', message: e.message });
+    }
   }
 
   emit('backfill_step', { groupName, step: '3_persist_start', toPersist: Math.min(messages.length, targetCount) });
@@ -623,11 +627,14 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
   let persistSkipped = 0;
   for (const m of messages) {
     try {
-      // persistMessage returns early (undefined) for messages with no body and
-      // no media — these are system notifications / reactions / etc.  We track
-      // them separately so a log of "stored:0" doesn't hide "fetched:100".
-      const result = await persistMessage(m, groupName);
-      if (result === undefined && !m.body && !m.isMedia) {
+      // persistMessage returns early (no-op) for messages with no body and no
+      // media — system notifications, reactions, group-join alerts, etc.
+      // We count them as skipped rather than stored so a "stored:0" in the
+      // logs doesn't hide "fetched:100, but all were system messages".
+      await persistMessage(m, groupName);
+      // persistMessage returns void whether it stored or skipped.  The only
+      // reliable way to distinguish is to re-check the guard it uses itself.
+      if (!m.body && !m.isMedia && !m.hasMedia) {
         persistSkipped++;
       } else {
         stored++;
