@@ -193,7 +193,17 @@ async function persistMessage(message, groupName) {
   const dw = getDualWrite();
   if (dw) {
     try {
-      const chatId = message.chatId?._serialized || message.from || '';
+      // wa_group_id resolution: try every field wppconnect might use for the chat ID.
+      // chatId._serialized is preferred (the full WA ID e.g. 12345@g.us).
+      // message.from is the group ID for group messages (author = sender inside group).
+      // chatId.remote._serialized appears in some older wppconnect builds.
+      // Falling back to '' silently stores an empty group ID in Postgres, which
+      // breaks the monitored_groups counter — so we prefer any non-empty candidate.
+      const chatId = message.chatId?._serialized
+        || message.from
+        || message.chatId?.remote?._serialized
+        || message.to
+        || '';
       await dw.writeRawMessage({
         user_id: userId,
         wa_group_id: chatId,
@@ -471,6 +481,7 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
   if (list('getAllMessagesInChat')) {
     emit('backfill_step', { groupName, step: '0b_sync_start' });
     let prev = -1, stable = 0;
+    let syncTimedOut = false; // set when a peek hits the 10s cap — used in backfill_synced below
     // 10s cap per peek: for large groups getAllMessagesInChat serialises thousands of
     // message objects over CDP and can block for the full 5-minute protocolTimeout.
     // A slow peek means the WA store is already populated; break immediately and let
@@ -492,6 +503,7 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
           // the harvest's getAllMessages* calls will also timeout. Flag it so Step 2
           // skips the two unbounded methods and goes straight to getMessages.
           groupIsLarge = true;
+          syncTimedOut = true;
           emit('backfill_step', { groupName, step: '0b_peek_timeout', iter: i, ms });
           break;
         }
@@ -506,9 +518,14 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
       if (peek.length === prev) stable++; else { stable = 0; prev = peek.length; }
       await new Promise(r => setTimeout(r, 1000));
     }
-    // prev = -1 means the loop exited on a peek_timeout before any successful peek.
-    // Emit 0 so callers see "nothing confirmed in store" rather than a sentinel -1.
-    emit('backfill_synced', { groupId, groupName, loaded: prev < 0 ? 0 : prev });
+    // prev = -1 means the loop exited on a peek_timeout before any successful peek
+    // (store is large, not empty). Emit 0 + timedOut:true so callers can
+    // distinguish "genuinely empty store" from "store too large to count quickly".
+    emit('backfill_synced', {
+      groupId, groupName,
+      loaded: prev < 0 ? 0 : prev,
+      timedOut: syncTimedOut,
+    });
   }
 
   // Step 1: scroll back through the chat repeatedly to force WA Web to
