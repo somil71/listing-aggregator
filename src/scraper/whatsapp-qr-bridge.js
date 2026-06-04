@@ -371,6 +371,16 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
   // the cheapest call available. If this returns fast but openChat hangs, the
   // problem is openChat specifically. If this ALSO hangs, the whole Chromium
   // page is frozen (different bug — likely OOM / crashed renderer).
+  //
+  // TIMEOUT: 3 s (was 15 s). Logs showed all 4 probe methods hitting the old
+  // 15 s cap on every attempt, adding 60-70 s of pure overhead per openChat
+  // retry (180 s total for 3 attempts). The probe result doesn't change the
+  // logic — it's diagnostic only — so burning 15 s per method is wasteful.
+  // 3 s is enough to tell whether the page is healthy vs. busy/frozen.
+  //
+  // BREAK-EARLY: if the first probe times out (page is CPU-busy during WA's
+  // initial post-scan sync), all subsequent probe methods will also time out.
+  // Bail after the first timeout instead of trying all 4.
   const probePage = async () => {
     const probes = ['getConnectionState', 'isConnected', 'getWAVersion', 'getHostDevice'];
     for (const p of probes) {
@@ -379,7 +389,7 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
       try {
         const r = await Promise.race([
           activeClient[p](),
-          new Promise((_, rej) => setTimeout(() => rej(new Error('probe timeout 15s')), 15_000)),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('probe timeout 3s')), 3_000)),
         ]);
         emit('backfill_probe', {
           groupName, probe: p, ms: Date.now() - t0,
@@ -390,7 +400,10 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
         emit('backfill_probe', {
           groupName, probe: p, ms: Date.now() - t0, alive: false, error: e.message,
         });
-        // try the next probe method before declaring the page dead
+        // If it timed out, the page is busy — every subsequent method will
+        // also time out. Stop probing and report dead immediately.
+        if (e.message.includes('probe timeout')) break;
+        // Otherwise (method not found, etc.) try the next probe method.
       }
     }
     return false;
