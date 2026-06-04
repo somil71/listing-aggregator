@@ -169,7 +169,11 @@ async function persistMessage(message, groupName) {
   );
 
   const parsed = parser.parse(text, senderName);
-  if (parsed.confidence > 0) {
+  // Threshold: 0.3 minimum.  The parser returns tiny non-zero scores (e.g. 0.03)
+  // for greetings / non-listing text that happen to match a loose pattern.  We
+  // only want confident extractions in the listings table.  0.3 is well below the
+  // "real listing" zone (typically 0.7+) but safely above the noise floor.
+  if (parsed.confidence >= 0.3) {
     await dbRun(
       `INSERT OR IGNORE INTO listings
          (id, raw_message_id, price, location, bedrooms, property_type, area_sqft,
@@ -1018,7 +1022,10 @@ async function dispatchCmd(cmd) {
       });
     }
   } catch (err) {
-    emit('error', { message: 'dispatchCmd: ' + err.message });
+    // Non-fatal: a synchronous throw inside a command handler must not emit
+    // a top-level 'error' (the server would tear the bridge down and orphan
+    // Chromium). Warn instead so the issue is visible without killing the session.
+    emit('backfill_warning', { reason: 'dispatch_error', message: err.message });
   }
 }
 

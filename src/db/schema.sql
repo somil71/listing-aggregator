@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS listings (
   description TEXT,
   extraction_confidence REAL DEFAULT 0.5,
   image_paths TEXT,
+  currency TEXT,
 
   -- Timestamps
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
