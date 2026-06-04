@@ -236,7 +236,10 @@ async function loadMonitoredGroups() {
     try {
       rows = await dbAll('SELECT group_id, group_name FROM selected_groups WHERE user_id = ?', [userId]);
     } catch (err) {
-      emit('error', { message: 'loadMonitoredGroups: ' + err.message });
+      // Non-fatal: emit a warning, not 'error'. Emitting 'error' causes the
+      // server to tear the bridge down (it treats it as a fatal crash), which
+      // would orphan the Chromium process and leave the user stuck.
+      emit('backfill_warning', { reason: 'load_groups_failed', message: err.message });
       return [];
     }
   }
@@ -274,6 +277,15 @@ function wireMessageListener() {
 
 async function backfillGroup(groupId, groupName, targetCount = 1000) {
   emit('backfill_start', { groupName, targetCount });
+
+  // Guard: activeClient can go null if the user disconnects mid-backfill.
+  // Without this check, `activeClient[name]` below throws TypeError which
+  // propagates to runBackfillBatch's catch and emits a warning (harmless),
+  // but also makes the entire page-lock hang rather than releasing cleanly.
+  if (!activeClient) {
+    emit('backfill_warning', { groupName, reason: 'client_gone', message: 'activeClient is null — skipping' });
+    return 0;
+  }
 
   const list = (name) => typeof activeClient[name] === 'function';
   emit('backfill_methods', {
@@ -494,7 +506,9 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
       if (peek.length === prev) stable++; else { stable = 0; prev = peek.length; }
       await new Promise(r => setTimeout(r, 1000));
     }
-    emit('backfill_synced', { groupId, groupName, loaded: prev });
+    // prev = -1 means the loop exited on a peek_timeout before any successful peek.
+    // Emit 0 so callers see "nothing confirmed in store" rather than a sentinel -1.
+    emit('backfill_synced', { groupId, groupName, loaded: prev < 0 ? 0 : prev });
   }
 
   // Step 1: scroll back through the chat repeatedly to force WA Web to
@@ -849,7 +863,12 @@ function runBackfillBatch(label, startEvent) {
       emit('backfill_complete', { totalStored: retryTotal, groups: empty.length, retry: true });
     }
   })()
-    .catch(err => emit('error', { message: `${label}: ` + err.message }))
+    .catch(err => {
+      // Use backfill_warning not 'error'. A top-level 'error' event causes the
+      // server to tear the bridge down (orphaning Chromium). Backfill failures
+      // are non-fatal — the bridge itself is still alive and healthy.
+      emit('backfill_warning', { reason: 'batch_error', message: err.message });
+    })
     .finally(() => { _backfillInFlight = false; });
 }
 

@@ -568,8 +568,18 @@ class WhatsAppService {
       this._emit(userId, 'backfill_complete', {
         totalStored: data.totalStored,
         groups: data.groups,
+        retry: data.retry || false,   // preserve so dashboard can distinguish initial vs retry
       });
-      console.log(`[whatsapp] backfill complete: ${data.totalStored} messages from ${data.groups} groups`);
+      console.log(`[whatsapp] backfill complete${data.retry ? ' (retry)' : ''}: ${data.totalStored} messages from ${data.groups} groups`);
+    } else if (type === 'persist_error') {
+      // Diagnostic: fired when persistMessage throws (e.g. "no such table")
+      console.error(`[whatsapp] persist_error for ${userId} (${data.groupName}): ${data.error}`);
+    } else if (type === 'backfill_msg_sample') {
+      // Diagnostic: fired once per backfill with the fetched message structure
+      console.log(`[whatsapp] msg_sample ${data.groupName}: type=${data.type} bodyLen=${data.bodyLen} isMedia=${data.isMedia} hasMedia=${data.hasMedia} keys=${(data.keys||[]).join(',')}`);
+    } else if (type === 'backfill_persist_summary') {
+      // Fired only when there were errors or skips — otherwise silent
+      console.warn(`[whatsapp] persist_summary ${data.groupName}: stored=${data.stored} errors=${data.persistErrors} skipped=${data.persistSkipped} total=${data.total}`);
     } else if (type === 'listing_stored') {
       // Live notification when the parser extracts a listing from a real-time msg
       this._emit(userId, 'listing_stored', data);
