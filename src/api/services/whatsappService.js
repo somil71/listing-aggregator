@@ -650,20 +650,25 @@ class WhatsAppService {
       );
     }
 
-    // Mirror to Postgres so the REST API and other services can read group info
+    // Mirror to Postgres — wrap in a transaction so a crash between DELETE and
+    // INSERT does not leave the user with zero monitored groups permanently.
+    // Without the transaction, loadMonitoredGroups() on the next boot would
+    // return 0 rows and the bridge would silently monitor nothing.
     try {
-      await pg.query(
-        `DELETE FROM monitored_groups WHERE user_id = (SELECT id FROM users WHERE clerk_user_id = $1)`,
-        [userId]
-      );
-      for (let i = 0; i < groupIds.length; i++) {
-        await pg.query(
-          `INSERT INTO monitored_groups (user_id, wa_group_id, group_name)
-           SELECT id, $2, $3 FROM users WHERE clerk_user_id = $1
-           ON CONFLICT (user_id, wa_group_id) DO UPDATE SET group_name = EXCLUDED.group_name`,
-          [userId, groupIds[i], groupNames[i] || groupIds[i]]
+      await pg.withTransaction(async (client) => {
+        await client.query(
+          `DELETE FROM monitored_groups WHERE user_id = (SELECT id FROM users WHERE clerk_user_id = $1)`,
+          [userId]
         );
-      }
+        for (let i = 0; i < groupIds.length; i++) {
+          await client.query(
+            `INSERT INTO monitored_groups (user_id, wa_group_id, group_name)
+             SELECT id, $2, $3 FROM users WHERE clerk_user_id = $1
+             ON CONFLICT (user_id, wa_group_id) DO UPDATE SET group_name = EXCLUDED.group_name`,
+            [userId, groupIds[i], groupNames[i] || groupIds[i]]
+          );
+        }
+      });
     } catch (pgErr) {
       console.warn('[whatsapp] selectGroups Postgres mirror failed:', pgErr.message);
     }

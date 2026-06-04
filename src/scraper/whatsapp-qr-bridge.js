@@ -117,17 +117,31 @@ async function downloadMedia(message, messageId) {
 
 // Dual-write helper.  Lazy-required so missing pg env vars don't crash the
 // bridge when running without Postgres configured.
+// We retry the require() for up to 60s after boot to tolerate Railway's env-var
+// injection timing — if DATABASE_URL arrives a few seconds after the process
+// starts, the first call might fail but a subsequent call will succeed.
 let _dualWrite = null;
+let _dualWriteFailedAt = null;
+const DUAL_WRITE_RETRY_MS = 60_000;   // retry window after first failure
 function getDualWrite() {
-  if (_dualWrite === null) {
-    try {
-      _dualWrite = require('../db/dualWrite');
-    } catch (err) {
-      process.stderr.write(`[bridge] dual-write disabled: ${err.message}\n`);
-      _dualWrite = false;
-    }
+  if (_dualWrite !== null) return _dualWrite;  // already loaded ✓
+  // If we already tried and failed, only retry within the first 60s of boot
+  if (_dualWriteFailedAt !== null) {
+    if (Date.now() - _dualWriteFailedAt > DUAL_WRITE_RETRY_MS) return null; // give up
+    // else fall through and retry the require()
   }
-  return _dualWrite || null;
+  try {
+    _dualWrite = require('../db/dualWrite');
+    _dualWriteFailedAt = null;
+    return _dualWrite;
+  } catch (err) {
+    if (_dualWriteFailedAt === null) {
+      // Only log the first failure — retries are silent to avoid log spam
+      process.stderr.write(`[bridge] dual-write unavailable (will retry for ${DUAL_WRITE_RETRY_MS / 1000}s): ${err.message}\n`);
+      _dualWriteFailedAt = Date.now();
+    }
+    return null;
+  }
 }
 
 async function persistMessage(message, groupName) {
@@ -135,7 +149,12 @@ async function persistMessage(message, groupName) {
   // so backfill messages (wppconnect) and live messages (onMessage) both pass.
   if (!message.body && !message.isMedia && !message.hasMedia) return;
 
-  const messageId = message.id?._serialized || message.id || `${Date.now()}-${Math.random()}`;
+  // Prefer the WA-serialized ID (_serialized). Fall back to the raw id field if
+  // it is already a string. Last resort: generate a UUID — uuidv4 is collision-safe
+  // unlike the old Date.now()-Math.random() which could duplicate within the same ms.
+  const messageId = message.id?._serialized
+    || (typeof message.id === 'string' ? message.id : null)
+    || uuidv4();
   const ts = message.t ? new Date(message.t * 1000).toISOString() : new Date().toISOString();
 
   // sender_wa_id = the WhatsApp contact ID (e.g. "919XXXXXXXXX@c.us" or "@lid" internal ID)
@@ -272,11 +291,17 @@ function wireMessageListener() {
       if (!message.isGroupMsg && !chatId.endsWith('@g.us')) return;
       if (!monitoredGroupIds.has(chatId)) return;
 
-      // Resolve group name (cache via chat info)
+      // Resolve group name (cache via chat info).
+      // getChatById is a CDP call — cap it at 8s so a slow/hung call during
+      // a concurrent backfill doesn't block this handler for 300 s and pile
+      // up dangling promises under high-traffic groups.
       let groupName = message.chat?.name || message.chatName;
       if (!groupName) {
         try {
-          const chat = await activeClient.getChatById(chatId);
+          const chat = await Promise.race([
+            activeClient.getChatById(chatId),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('getChatById timeout')), 8_000)),
+          ]);
           groupName = chat?.name || chat?.formattedTitle || chatId;
         } catch (_) { groupName = chatId; }
       }

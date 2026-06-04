@@ -54,31 +54,15 @@ function contentHash(text) {
 //   { user_id, wa_group_id, wa_message_id, sender_wa_id, sender_name,
 //     text, ts_received, has_media, media_keys, group_name }
 async function writeRawMessage(msg) {
-  // 1. SQLite (existing path, idempotent)
+  // SQLite is written by persistMessage (Path A) BEFORE dualWrite is called.
+  // Re-inserting here would be a no-op (INSERT OR IGNORE hits the conflict)
+  // but if the already-open SQLite connection hasn't seen the latest schema
+  // changes it can throw — and the old `throw err` blocked the Postgres write
+  // entirely.  We skip the SQLite re-insert here so dualWrite is purely the
+  // Postgres + parse-queue path; persistMessage owns SQLite.
   const sqliteId = msg.wa_message_id;
-  try {
-    await sqlite.dbRun(
-      `INSERT OR IGNORE INTO raw_messages
-         (id, group_name, sender_name, message_text, timestamp,
-          has_images, image_count, image_paths)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        sqliteId,
-        msg.group_name || msg.wa_group_id,
-        msg.sender_name || msg.sender_wa_id || 'unknown',
-        msg.text || '',
-        msg.ts_received,
-        msg.has_media ? 1 : 0,
-        (msg.media_keys || []).length,
-        JSON.stringify(msg.media_keys || []),
-      ]
-    );
-  } catch (err) {
-    console.error('[dualWrite] sqlite raw insert failed:', err.message);
-    throw err;  // abort — keep old store consistent
-  }
 
-  // 2. Postgres (new, best-effort)
+  // Postgres (primary durable store)
   let pgRawId = null;
   try {
     const userUuid = await ensureUser(msg.user_id);
