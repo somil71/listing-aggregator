@@ -47,7 +47,7 @@
     "axios": "^1.16.1",
     "bcryptjs": "^3.0.3",
     "body-parser": "latest",
-    "bullmq": "^5.77.6",
+    "bullmq": "^5.78.0",
     "cookie-parser": "^1.4.7",
     "cors": "latest",
     "dayjs": "latest",
