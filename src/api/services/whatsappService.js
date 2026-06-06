@@ -2,7 +2,13 @@ const path = require('path');
 const fs = require('fs');
 const { promisify } = require('util');
 const execAsync = promisify(require('child_process').exec);
-const { Client, LocalAuth } = require('whatsapp-web.js');
+// NOTE: whatsapp-web.js is intentionally NOT imported here. The live flow uses
+// the wppconnect bridge subprocess (src/scraper/whatsapp-qr-bridge.js). The old
+// `const { Client, LocalAuth } = require('whatsapp-web.js')` was dead — Client/
+// LocalAuth were never used (this.clients holds bridge child handles, not WA
+// clients) — yet it ran at server boot, loaded a second full Puppeteer, and was
+// pinned to "latest", so any broken release of that package would crash the
+// entire API at startup. Removed.
 const QRCode = require('qrcode');
 const { v4: uuidv4 } = require('uuid');
 const { dbRun, dbAll, dbGet } = require('../db-helpers');

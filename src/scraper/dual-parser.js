@@ -56,14 +56,8 @@ function detectConflicts(llm, regex) {
   }
 
   // ── Bedrooms / unit_type ─────────────────────────────────────────────────
-  const regexCfg = regexParser.extractConfig(
-    // We need raw text — regex.description carries the summary, not original.
-    // The caller (parse()) passes the raw text separately; here we compare
-    // what the regex already extracted vs what the LLM extracted.
-    // Note: regex.bedrooms and regex.unit_type come from the full parse() call.
-    null  // placeholder — handled below in parse() where raw text is available
-  );
-  // Actual comparison is done where raw text is available (see parse())
+  // Compared in detectConflictsFull() where the raw text is available — this
+  // base function only handles fields present on the parsed objects themselves.
 
   // ── Furnished ─────────────────────────────────────────────────────────────
   const regexFurn = regex.furnished;
