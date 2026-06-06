@@ -466,13 +466,15 @@ class WhatsAppService {
         [userId, uuidv4(), userId, data.phone]
       );
       // Pre-warm the group scan so it completes in the background before the
-      // user opens the select-groups modal. wppconnect's chat DB needs ~10s to
-      // begin hydrating after ready, so we defer the initial scan by 8s.
-      // The scan result is cached; the modal's getGroups() call returns instantly.
+      // user opens the select-groups modal.
+      // Delay increased to 30 s (was 8 s): after a fresh QR scan WA Web spends
+      // 20-60 s computing its initial chat hydration.  At 8 s, getAllChats()
+      // always returned 0 and the cached empty result blocked subsequent fetches.
+      // At 30 s, the hydration is usually done and the first fetch returns data.
       setTimeout(() => {
         if (!this.clients.get(userId)?.ready) return; // disconnected in the meantime
         this.getGroups(userId).catch(() => {}); // best-effort; errors are non-fatal
-      }, 8000);
+      }, 30_000);
 
       // Resumed session → recover anything missed during downtime. Wait ~10s
       // first so WhatsApp Web has begun streaming the backlog from the phone;
@@ -484,8 +486,9 @@ class WhatsAppService {
           const e = this.clients.get(userId);
           if (!e || !e.ready) return;  // disconnected in the meantime
           console.log(`[whatsapp] auto-backfill after resume for ${userId}`);
-          bridgeBus.sendCommand(userId, { cmd: 'rescrape' }).catch(() => {});
-          try { writeCmdAtomic(e.cmdFile, { cmd: 'rescrape' }); } catch (_) {}
+          bridgeBus.sendCommand(userId, { cmd: 'rescrape' })
+            .then(redisSent => { if (!redisSent) try { writeCmdAtomic(e.cmdFile, { cmd: 'rescrape' }); } catch (_) {} })
+            .catch(() => { try { writeCmdAtomic(e.cmdFile, { cmd: 'rescrape' }); } catch (_) {} });
         }, 10000);
       }
     } else if (type === 'groups_progress') {
@@ -502,7 +505,11 @@ class WhatsAppService {
       // Cache so a subsequent getGroups() call (triggered by the groups_detected
       // SSE event on the client) resolves immediately without a second bridge scan.
       this._groupsCache = this._groupsCache || new Map();
-      this._groupsCache.set(userId, data.groups);
+      // Only cache non-empty results. An empty list from a timed-out pre-warm
+      // scan must not permanently block the user's groups modal.
+      if (data.groups.length > 0) {
+        this._groupsCache.set(userId, { groups: data.groups, at: Date.now() });
+      }
       this._emit(userId, 'groups_detected', {
         count: data.groups.length,
         totalChats: data.totalChats,
@@ -599,9 +606,15 @@ class WhatsAppService {
     if (!entry) throw new Error('WhatsApp not connected');
 
     // Return cached result from a recently completed scan immediately.
+    // Rules: cache must be non-empty AND less than 5 minutes old.
+    // An empty cache (pre-warm ran before WA hydrated) must NOT block a fresh
+    // scan — otherwise the user's modal is permanently stuck showing 0 groups.
     this._groupsCache = this._groupsCache || new Map();
     const cached = this._groupsCache.get(userId);
-    if (cached) return cached;
+    const CACHE_TTL_MS = 5 * 60 * 1000;
+    if (cached && cached.groups.length > 0 && Date.now() - cached.at < CACHE_TTL_MS) {
+      return cached.groups;
+    }
 
     this._groupsByUser = this._groupsByUser || new Map();
 
@@ -628,12 +641,17 @@ class WhatsAppService {
 
     this._groupsByUser.set(userId, { promise, resolve, reject });
 
-    // Send via Redis when available; fall back to atomic file write for
-    // single-instance dev mode.
+    // Send via Redis when available; fall back to atomic file write ONLY when
+    // Redis did not deliver (single-instance dev mode, or Redis unavailable).
+    // Previously both paths fired simultaneously with different timestamps,
+    // passing the bridge's dedup filter and queuing two getAllChats() calls
+    // back-to-back — doubling browser load at the worst possible moment.
     try {
-      await bridgeBus.sendCommand(userId, { cmd: 'get_groups' });
-      writeCmdAtomic(entry.cmdFile, { cmd: 'get_groups' });
-    } catch (_) {}
+      const redisSent = await bridgeBus.sendCommand(userId, { cmd: 'get_groups' });
+      if (!redisSent) writeCmdAtomic(entry.cmdFile, { cmd: 'get_groups' });
+    } catch (_) {
+      try { writeCmdAtomic(entry.cmdFile, { cmd: 'get_groups' }); } catch (_2) {}
+    }
     return promise;
   }
 
@@ -680,11 +698,14 @@ class WhatsAppService {
 
     // Tell the bridge to start monitoring these groups: reload the table,
     // wire the message listener (if not already), and backfill recent messages.
+    // Send via Redis only; fall back to file when Redis unavailable.
+    // Sending both simultaneously caused two concurrent backfill triggers.
     try {
-      await bridgeBus.sendCommand(userId, { cmd: 'start_monitoring' });
-      writeCmdAtomic(entry.cmdFile, { cmd: 'start_monitoring' });
+      const redisSent = await bridgeBus.sendCommand(userId, { cmd: 'start_monitoring' });
+      if (!redisSent) writeCmdAtomic(entry.cmdFile, { cmd: 'start_monitoring' });
     } catch (err) {
       console.error(`[whatsapp] failed to send start_monitoring cmd: ${err.message}`);
+      try { writeCmdAtomic(entry.cmdFile, { cmd: 'start_monitoring' }); } catch (_) {}
     }
 
     return { saved: groupIds.length };

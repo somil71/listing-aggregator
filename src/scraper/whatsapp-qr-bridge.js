@@ -1013,9 +1013,18 @@ async function dispatchCmd(cmd) {
       // hydrates over the next 5–30 seconds as the WA Web client syncs.
       // Poll until we see chats, then return the groups.  Up to 90s total.
       (async () => {
-        // Per-call timeout: wppconnect's getAllChats() can hang indefinitely when
-        // WA Web is still hydrating its internal chat store. Without a timeout the
-        // whole polling loop stalls on a single await, defeating the MAX_MS guard.
+        // Per-call timeout for getAllChats().
+        //
+        // Root cause of "groups take 2+ minutes / sometimes empty":
+        // getAllChats() serialises 500+ chat objects over CDP and can take 30-90 s
+        // on a freshly-linked session while WA Web is hydrating.  The old 25 s
+        // timeout fired before the browser finished computing, but the browser
+        // KEPT RUNNING the call in the background.  The next iteration immediately
+        // queued another getAllChats() — the browser had to complete the first one
+        // before starting the second, so each iteration actually took 60-90 s from
+        // the browser's perspective while we saw "25 s timeout, got []" on every
+        // pass.  The fix: raise the timeout to 90 s so the browser can actually
+        // finish and return real data on the first attempt.
         const withTimeout = (promise, ms) => Promise.race([
           promise,
           new Promise((_, rej) => setTimeout(() => rej(new Error('fetchChats timeout')), ms)),
@@ -1037,10 +1046,10 @@ async function dispatchCmd(cmd) {
           // it runs while a backfill is mid-openChat on the same page, one
           // destroys the other's execution context ("Promise was collected").
           if (typeof activeClient.getAllChats === 'function') {
-            try { return (await withTimeout(activeClient.getAllChats(), 25_000)) || []; } catch (_) {}
+            try { return (await withTimeout(activeClient.getAllChats(), 90_000)) || []; } catch (_) {}
           }
           if (typeof activeClient.listChats === 'function') {
-            try { return (await withTimeout(activeClient.listChats(), 25_000)) || []; } catch (_) {}
+            try { return (await withTimeout(activeClient.listChats(), 90_000)) || []; } catch (_) {}
           }
           return [];
         });
@@ -1062,9 +1071,12 @@ async function dispatchCmd(cmd) {
           .filter(g => g.id);
 
         const startedAt = Date.now();
-        // MAX_MS must stay well under the server's 130s getGroups timeout so the
-        // bridge always answers before the server gives up (which surfaced as 500).
-        const MAX_MS    = 90_000;
+        // MAX_MS: server's getGroups() promise times out at 130 s.  We need to
+        // emit 'groups' before that so the HTTP handler resolves cleanly.
+        // With getAllChats() now allowed 90 s, a single iteration can take up to
+        // 90 s + 5 s poll = 95 s.  Set MAX_MS to 120 s so we always get at
+        // least one full attempt, and the bridge still beats the 130 s server cap.
+        const MAX_MS    = 120_000;
         const STABLE_MS = 10_000;  // group count steady for 10 s → accept
         const MIN_MS    = 8_000;   // always wait at least 8 s for hydration
         let attempts = 0;
