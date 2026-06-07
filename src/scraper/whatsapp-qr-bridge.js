@@ -647,14 +647,11 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
     }
   }
 
-  if (!groupIsLarge && messages.length === 0 && list('loadAndGetAllMessagesInChat')) {
-    try {
-      messages = await timed('loadAndGetAllMessagesInChat(harvest)', () => activeClient.loadAndGetAllMessagesInChat(groupId, true, false));
-      emit('backfill_loaded', { groupName, method: 'loadAndGetAllMessagesInChat', count: messages.length });
-    } catch (e) {
-      emit('backfill_warning', { groupName, reason: 'harvest_failed', message: e.message });
-    }
-  }
+  // NOTE: loadAndGetAllMessagesInChat is intentionally NOT used. The installed
+  // wppconnect build throws "n.loadEarlierMsgs is not a function" on every call
+  // (the underlying WAPI method was removed/renamed), so it can never succeed —
+  // it only burned 0.2-5 s and logged scary errors. getMessages below covers the
+  // same need (bounded recent-message fetch).
 
   if (messages.length === 0 && list('getMessages')) {
     try {
@@ -664,8 +661,16 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
       // large groups to stay within the budget — 100 recent messages is plenty
       // to seed the dashboard while keeping CDP round-trip time well under 30 s.
       const harvestCount = groupIsLarge ? 100 : targetCount;
-      messages = await timed('getMessages(harvest)', () =>
-        activeClient.getMessages(groupId, { count: harvestCount, direction: 'before' }));
+      // Hard timeout: when groupIsLarge (openChat failed → page is CPU-busy or
+      // frozen), getMessages can hang on Runtime.callFunctionOn for the full
+      // 300 s protocolTimeout, burning 5 minutes per retry cycle for nothing.
+      // Cap it at 45 s via Promise.race so we fail fast and let the 60 s retry
+      // loop try again once the page has settled, instead of pinning the page.
+      const HARVEST_TIMEOUT_MS = 45_000;
+      messages = await timed('getMessages(harvest)', () => Promise.race([
+        activeClient.getMessages(groupId, { count: harvestCount, direction: 'before' }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error(`getMessages timeout after ${HARVEST_TIMEOUT_MS}ms`)), HARVEST_TIMEOUT_MS)),
+      ]), { harvestCount });
       emit('backfill_loaded', { groupName, method: 'getMessages', count: messages.length, harvestCount });
     } catch (e) {
       emit('backfill_warning', { groupName, reason: 'harvest_failed', method: 'getMessages', message: e.message });
