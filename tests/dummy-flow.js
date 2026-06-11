@@ -8,7 +8,7 @@
  *   Stage 3  – Parser: real estate text parsed into structured fields
  *   Stage 4  – loadMonitoredGroups: SQLite fallback when Postgres absent
  *   Stage 5  – backfillGroup: full stage flow with a stub activeClient
- *   Stage 6  – backfillGroup: groupIsLarge path (openChat fails → count:100)
+ *   Stage 6  – backfillGroup: groupIsLarge path (openChat fails → paginated harvest)
  *   Stage 7  – backfillGroup: persist_error surfaced (bad table name)
  *   Stage 8  – dualWrite: Postgres path gracefully skipped when unavailable
  *
@@ -414,9 +414,11 @@ async function testBackfillHappyPath() {
 // ── Stage 6: groupIsLarge path (openChat fails) ───────────────────────────────
 
 async function testBackfillLargeGroup() {
-  section('Stage 6 — backfillGroup (openChat fails → groupIsLarge=true → count:100)');
+  section('Stage 6 — backfillGroup (openChat fails → groupIsLarge=true → paginated harvest)');
   const db = await openDb();
 
+  // 150 messages, 1/min — all inside the 30 h coverage window. The old flat
+  // count:100 cap would silently drop the oldest 50; pagination must get all 150.
   const mockMessages = Array.from({ length: 150 }, (_, i) => ({
     id:         { _serialized: `LARGE-${String(i).padStart(3, '0')}` },
     body:       `Listing ${i}: 2BHK flat AED ${60000 + i * 100}/yr JLT`,
@@ -435,8 +437,13 @@ async function testBackfillLargeGroup() {
     getAllMessagesInChat: async () => [],   // empty because openChat never loaded it
     getMessages:         async (chatId, opts) => {
       const count = opts?.count || 100;
-      // Simulate: store IS populated by multi-device sync → return last `count`
-      return mockMessages.slice(-count);
+      // Simulate WA's before-cursor: no id → newest `count`; with id → the
+      // `count` messages immediately older than that message.
+      const end = opts?.id
+        ? mockMessages.findIndex(m => m.id._serialized === opts.id)
+        : mockMessages.length;
+      if (end < 0) return [];
+      return mockMessages.slice(Math.max(0, end - count), end);
     },
     getConnectionState: async () => 'CONNECTED',
   };
@@ -468,22 +475,45 @@ async function testBackfillLargeGroup() {
     : fail('Stage 6 sync: unexpected state', `peek=${peek.length} large=${groupIsLarge}`);
 
   // Step 2 — because groupIsLarge, skip getAllMessagesInChat/loadAndGetAllMessagesInChat
-  //           and use getMessages({count:100}) directly
-  const harvestCount = groupIsLarge ? 100 : 1000;
-  let messages = [];
-  if (messages.length === 0) {
-    messages = await stubClient.getMessages(groupId, { count: harvestCount, direction: 'before' });
+  //           and paginate getMessages backwards via the `before` cursor until the
+  //           day-coverage cutoff / short page / page cap (mirrors the bridge loop).
+  const PAGE_SIZE = 100, MAX_PAGES = 10, COVERAGE_HOURS = 30;
+  const cutoffTs = Math.floor(Date.now() / 1000) - COVERAGE_HOURS * 3600;
+
+  let cursorId = null, pages = 0;
+  const collected = [], seen = new Set();
+  while (pages < MAX_PAGES) {
+    const params = { count: PAGE_SIZE, direction: 'before' };
+    if (cursorId) params.id = cursorId;
+    const page = await stubClient.getMessages(groupId, params);
+    if (!Array.isArray(page) || page.length === 0) break;
+    let oldest = null, reachedCutoff = false;
+    for (const m of page) {
+      if (!m) continue;
+      const id = m.id?._serialized || (typeof m.id === 'string' ? m.id : null);
+      if (id) { if (seen.has(id)) continue; seen.add(id); }
+      collected.push(m);
+      if (!oldest || (m.t && oldest.t && m.t < oldest.t) || (m.t && !oldest.t)) oldest = m;
+      if (m.t && m.t < cutoffTs) reachedCutoff = true;
+    }
+    pages++;
+    if (reachedCutoff) break;
+    if (page.length < PAGE_SIZE) break;
+    const next = oldest?.id?._serialized || null;
+    if (!next || next === cursorId) break;
+    cursorId = next;
   }
+  const messages = collected;
 
-  harvestCount === 100
-    ? pass(`Stage 6 harvest: harvestCount correctly capped at 100 (not 1000)`)
-    : fail(`Stage 6 harvest: harvestCount=${harvestCount}, expected 100`);
+  messages.length === 150
+    ? pass(`Stage 6 harvest: pagination collected all ${messages.length} messages (flat-100 would drop 50)`)
+    : fail(`Stage 6 harvest: expected 150, got ${messages.length}`);
 
-  messages.length === 100
-    ? pass(`Stage 6 harvest: getMessages returned ${messages.length} messages`)
-    : fail(`Stage 6 harvest: expected 100, got ${messages.length}`);
+  pages === 2
+    ? pass(`Stage 6 harvest: used ${pages} bounded pages of ${PAGE_SIZE} (no unbounded count:1000 call)`)
+    : fail(`Stage 6 harvest: expected 2 pages, got ${pages}`);
 
-  // Step 3 — persist all 100
+  // Step 3 — persist all 150
   let stored = 0;
   for (const m of messages) {
     if (!m.body && !m.isMedia && !m.hasMedia) continue;
@@ -500,9 +530,9 @@ async function testBackfillLargeGroup() {
     } catch (_) {}
   }
 
-  stored === 100
-    ? pass(`Stage 6 persist: stored all 100 capped messages`)
-    : fail(`Stage 6 persist: stored ${stored}/100`);
+  stored === 150
+    ? pass(`Stage 6 persist: stored all ${stored} paginated messages`)
+    : fail(`Stage 6 persist: stored ${stored}/150`);
 
   db.close();
 }

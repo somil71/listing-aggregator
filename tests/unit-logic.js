@@ -21,7 +21,7 @@
  *   T13 – pre-warm delay: 30 s, not 8 s (value check)
  *   T14 – backfill retry: only fires once (not infinite)
  *   T15 – groupIsLarge: set true when openChat exhausts all retries
- *   T16 – harvestCount: 100 when groupIsLarge, 1000 otherwise
+ *   T16 – large-group harvest: paginated (cursor + day-coverage cutoff), not flat count:100
  *   T17 – null message guard: null element in messages array → persistSkipped
  *   T18 – non-array guard: messages coerced to [] if not array
  *   T19 – confidence threshold: 0.3 minimum, not > 0
@@ -333,19 +333,92 @@ async function testGroupIsLarge() {
     ? pass('T15: groupIsLarge=true after 3 openChat failures')
     : fail('T15: groupIsLarge NOT set after openChat exhausted');
 
-  section('T16 — harvestCount: 100 when groupIsLarge, 1000 otherwise');
+  section('T16 — large-group harvest: paginated, covers a full day, never flat-100');
 
-  const targetCount = 1000;
-  const harvestWhenLarge   = groupIsLarge ? 100 : targetCount;
-  const harvestWhenSmall   = false        ? 100 : targetCount;
+  // T16a/T16b: source checks (T11-style) — the old tautological version of this
+  // test re-implemented `groupIsLarge ? 100 : targetCount` inline and kept
+  // passing after the source changed. Read the bridge source instead so the
+  // test fails loudly if the pagination is ever reverted to a flat cap.
+  const bridgeSrc = fs.readFileSync(
+    path.resolve(__dirname, '../src/scraper/whatsapp-qr-bridge.js'), 'utf8'
+  );
 
-  harvestWhenLarge === 100
-    ? pass('T16a: harvestCount=100 when groupIsLarge (prevents 300 s CDP timeout)')
-    : fail('T16a: harvestCount wrong for large group', String(harvestWhenLarge));
+  !bridgeSrc.includes('groupIsLarge ? 100 : targetCount')
+    ? pass('T16a: flat harvestCount cap removed from source (was silent yesterday-truncation)')
+    : fail('T16a: source still uses flat `groupIsLarge ? 100 : targetCount` cap');
 
-  harvestWhenSmall === 1000
-    ? pass('T16b: harvestCount=1000 for normal groups (full backfill)')
-    : fail('T16b: harvestCount wrong for normal group', String(harvestWhenSmall));
+  bridgeSrc.includes('COVERAGE_HOURS = 30') && bridgeSrc.includes('MAX_PAGES = 10')
+    ? pass('T16b: pagination constants present (COVERAGE_HOURS=30, MAX_PAGES=10)')
+    : fail('T16b: pagination constants missing from bridge source');
+
+  // T16c–T16f: behavioural simulation of the pagination loop, mirroring the
+  // source: bounded pages of 100 going backwards via a `before` cursor, stop
+  // on day-coverage cutoff / short page / stalled cursor, dedup by message id.
+  const PAGE_SIZE = 100, MAX_PAGES = 10, COVERAGE_HOURS = 30;
+  const nowSec  = Math.floor(Date.now() / 1000);
+  const cutoff  = nowSec - COVERAGE_HOURS * 3600;
+
+  // Stub chat: 350 messages, newest first, 12 min apart → ~70 h of history.
+  // Yesterday's coverage (30 h) needs 150 messages — i.e. > the old flat 100.
+  const allMsgs = Array.from({ length: 350 }, (_, i) => ({
+    id: { _serialized: `MSG-${i}` },
+    t: nowSec - i * 720,
+  }));
+  const pageAfter = (cursorId) => {
+    const start = cursorId ? allMsgs.findIndex(m => m.id._serialized === cursorId) + 1 : 0;
+    return allMsgs.slice(start, start + PAGE_SIZE);
+  };
+
+  const runPagination = (fetch) => {
+    let cursorId = null, pages = 0;
+    const collected = [], seen = new Set();
+    while (pages < MAX_PAGES) {
+      const page = fetch(cursorId);
+      if (!Array.isArray(page) || page.length === 0) break;
+      let oldest = null, reachedCutoff = false;
+      for (const m of page) {
+        if (!m) continue;
+        const id = m.id?._serialized || (typeof m.id === 'string' ? m.id : null);
+        if (id) { if (seen.has(id)) continue; seen.add(id); }
+        collected.push(m);
+        if (!oldest || (m.t && oldest.t && m.t < oldest.t) || (m.t && !oldest.t)) oldest = m;
+        if (m.t && m.t < cutoff) reachedCutoff = true;
+      }
+      pages++;
+      if (reachedCutoff) break;
+      if (page.length < PAGE_SIZE) break;
+      const next = oldest?.id?._serialized || null;
+      if (!next || next === cursorId) break;
+      cursorId = next;
+    }
+    return { collected, pages };
+  };
+
+  const r1 = runPagination(pageAfter);
+  const coveredYesterday = r1.collected.filter(m => m.t >= cutoff).length;
+  coveredYesterday >= 150 && r1.collected.length > 100
+    ? pass(`T16c: pagination collected ${r1.collected.length} msgs (full 30 h window; flat-100 would truncate)`)
+    : fail('T16c: pagination did not cover the full day window', `collected=${r1.collected.length} inWindow=${coveredYesterday}`);
+
+  r1.pages <= MAX_PAGES && r1.collected.length <= PAGE_SIZE * MAX_PAGES
+    ? pass(`T16d: stopped at cutoff after ${r1.pages} pages (caps respected)`)
+    : fail('T16d: page/message caps exceeded', `pages=${r1.pages}`);
+
+  // T16e: stalled cursor (same page returned forever) must terminate, not spin.
+  const r2 = runPagination(() => allMsgs.slice(0, PAGE_SIZE));
+  r2.pages < MAX_PAGES && r2.collected.length === PAGE_SIZE
+    ? pass('T16e: stalled cursor terminates loop (no infinite spin, no duplicates)')
+    : fail('T16e: stalled cursor did not terminate cleanly', `pages=${r2.pages} collected=${r2.collected.length}`);
+
+  // T16f: overlapping pages (server returns 20 already-seen msgs) are deduped.
+  const overlapping = (cursorId) => {
+    const start = cursorId ? Math.max(0, allMsgs.findIndex(m => m.id._serialized === cursorId) - 19) : 0;
+    return allMsgs.slice(start, start + PAGE_SIZE);
+  };
+  const r3 = runPagination(overlapping);
+  new Set(r3.collected.map(m => m.id._serialized)).size === r3.collected.length
+    ? pass('T16f: overlapping pages deduped by message id')
+    : fail('T16f: duplicate messages in collected output');
 }
 
 // ── T17–T18: null and non-array message guards ────────────────────────────────

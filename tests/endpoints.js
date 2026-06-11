@@ -59,11 +59,13 @@ async function runEndpoints() {
 
   // ── 2.1 Health ───────────────────────────────────────────────────────
   console.log('\n2.1 Health & Public Routes');
+  // Hardened contract: /health returns the minimal { success, status:'ok' }
+  // (no database/uptime detail — that leaked deployment info). Mirrors smoke.js.
   const h = await request('GET', '/health').catch(() => null);
   check('GET /health → 200',          h?.status === 200);
   check('body.success === true',       h?.body?.success === true);
-  check('body.database.connected',     h?.body?.database?.connected === true);
-  check('body.uptime > 0',            (h?.body?.uptime ?? 0) > 0);
+  check("body.status === 'ok'",        h?.body?.status === 'ok');
+  check('no internal detail leaked',   h?.body?.database === undefined && h?.body?.uptime === undefined);
 
   // ── 2.2 Listings ─────────────────────────────────────────────────────
   console.log('\n2.2 Listings Endpoints');

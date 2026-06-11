@@ -1446,12 +1446,18 @@ async function startServer() {
     // before the previous shutdown. We delay 3s so the HTTP listener is
     // settled before we fork child processes that may eat a chunk of CPU
     // while wppconnect spins up Chromium.
-    setTimeout(() => {
-      const whatsappService = require('./services/whatsappService');
-      whatsappService.autoResumeBridges().catch(err =>
-        logger.warn('autoResumeBridges failed', { error: err.message })
-      );
-    }, 3000).unref();
+    // WA_AUTO_RESUME=0 disables this (test runs / local debugging where
+    // spawning Chromium against a real saved session is unwanted).
+    if (process.env.WA_AUTO_RESUME !== '0') {
+      setTimeout(() => {
+        const whatsappService = require('./services/whatsappService');
+        whatsappService.autoResumeBridges().catch(err =>
+          logger.warn('autoResumeBridges failed', { error: err.message })
+        );
+      }, 3000).unref();
+    } else {
+      logger.info('WA auto-resume disabled (WA_AUTO_RESUME=0)');
+    }
 
     // Start the parse worker in-process so listings are created without a
     // separate Railway service.  The worker's SIGTERM handler already sets

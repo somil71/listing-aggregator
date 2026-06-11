@@ -654,26 +654,82 @@ async function backfillGroup(groupId, groupName, targetCount = 1000) {
   // same need (bounded recent-message fetch).
 
   if (messages.length === 0 && list('getMessages')) {
-    try {
-      // Large groups have thousands of messages loaded in the WA Web JS store.
-      // getMessages still serialises each result object over CDP, so count:1000
-      // routinely hits the 300 s protocolTimeout.  Use a much smaller count for
-      // large groups to stay within the budget — 100 recent messages is plenty
-      // to seed the dashboard while keeping CDP round-trip time well under 30 s.
-      const harvestCount = groupIsLarge ? 100 : targetCount;
-      // Hard timeout: when groupIsLarge (openChat failed → page is CPU-busy or
-      // frozen), getMessages can hang on Runtime.callFunctionOn for the full
-      // 300 s protocolTimeout, burning 5 minutes per retry cycle for nothing.
-      // Cap it at 45 s via Promise.race so we fail fast and let the 60 s retry
-      // loop try again once the page has settled, instead of pinning the page.
-      const HARVEST_TIMEOUT_MS = 45_000;
-      messages = await timed('getMessages(harvest)', () => Promise.race([
-        activeClient.getMessages(groupId, { count: harvestCount, direction: 'before' }),
-        new Promise((_, rej) => setTimeout(() => rej(new Error(`getMessages timeout after ${HARVEST_TIMEOUT_MS}ms`)), HARVEST_TIMEOUT_MS)),
-      ]), { harvestCount });
-      emit('backfill_loaded', { groupName, method: 'getMessages', count: messages.length, harvestCount });
-    } catch (e) {
-      emit('backfill_warning', { groupName, reason: 'harvest_failed', method: 'getMessages', message: e.message });
+    // Hard timeout per call: when groupIsLarge (openChat failed → page is
+    // CPU-busy or frozen), getMessages can hang on Runtime.callFunctionOn for
+    // the full 300 s protocolTimeout, burning 5 minutes per retry cycle for
+    // nothing. Cap each call at 45 s via Promise.race so we fail fast.
+    const HARVEST_TIMEOUT_MS = 45_000;
+    const fetchPage = (params) => Promise.race([
+      activeClient.getMessages(groupId, params),
+      new Promise((_, rej) => setTimeout(() => rej(new Error(`getMessages timeout after ${HARVEST_TIMEOUT_MS}ms`)), HARVEST_TIMEOUT_MS)),
+    ]);
+
+    if (!groupIsLarge) {
+      try {
+        messages = await timed('getMessages(harvest)', () => fetchPage({ count: targetCount, direction: 'before' }), { harvestCount: targetCount });
+        emit('backfill_loaded', { groupName, method: 'getMessages', count: messages.length, harvestCount: targetCount });
+      } catch (e) {
+        emit('backfill_warning', { groupName, reason: 'harvest_failed', method: 'getMessages', message: e.message });
+      }
+    } else {
+      // Large/active groups: a single count:1000 call serialises thousands of
+      // objects over CDP and routinely hits the 300 s protocolTimeout — but a
+      // flat count:100 cap (the old behaviour) silently truncates "yesterday's
+      // listings" for any group posting >100 messages/day, breaking the
+      // digest's "whole day" guarantee. Paginate instead: fetch bounded pages
+      // of 100 going backwards via the `before` cursor, stopping once we've
+      // covered a full day plus buffer (or hit the safety caps below).
+      const PAGE_SIZE = 100;
+      const MAX_PAGES = 10;                 // hard cap: 1000 msgs total, same ceiling as targetCount
+      const COVERAGE_HOURS = 30;            // yesterday (24h) + buffer for clock/timezone drift
+      const PAGE_BUDGET_MS = 45_000;
+      const overallStart = Date.now();
+      const OVERALL_BUDGET_MS = 4 * 60_000; // stay well under the 5-min protocolTimeout window
+      const cutoffTs = Math.floor(Date.now() / 1000) - COVERAGE_HOURS * 3600;
+
+      let cursorId = null;
+      let pages = 0;
+      const collected = [];
+      const seen = new Set();
+
+      while (pages < MAX_PAGES && Date.now() - overallStart < OVERALL_BUDGET_MS) {
+        const params = { count: PAGE_SIZE, direction: 'before' };
+        if (cursorId) params.id = cursorId;
+        let page;
+        try {
+          page = await timed('getMessages(harvest_page)', () => fetchPage(params), { page: pages, cursorId, budgetMs: PAGE_BUDGET_MS });
+        } catch (e) {
+          emit('backfill_warning', { groupName, reason: 'harvest_failed', method: 'getMessages', page: pages, message: e.message });
+          break;
+        }
+        if (!Array.isArray(page) || page.length === 0) break;
+
+        let oldest = null;
+        let reachedCutoff = false;
+        for (const m of page) {
+          if (!m) continue;
+          const id = m.id?._serialized || (typeof m.id === 'string' ? m.id : null);
+          if (id) {
+            if (seen.has(id)) continue;
+            seen.add(id);
+          }
+          collected.push(m);
+          if (!oldest || (m.t && oldest.t && m.t < oldest.t) || (m.t && !oldest.t)) oldest = m;
+          if (m.t && m.t < cutoffTs) reachedCutoff = true;
+        }
+
+        pages++;
+        emit('backfill_step', { groupName, step: 'large_harvest_page', page: pages, pageCount: page.length, total: collected.length, reachedCutoff });
+
+        if (reachedCutoff) break;             // we have everything back through "yesterday"
+        if (page.length < PAGE_SIZE) break;   // no more history to page through
+        const nextCursor = oldest?.id?._serialized || (typeof oldest?.id === 'string' ? oldest.id : null);
+        if (!nextCursor || nextCursor === cursorId) break; // can't advance — avoid infinite loop
+        cursorId = nextCursor;
+      }
+
+      messages = collected;
+      emit('backfill_loaded', { groupName, method: 'getMessages(paginated)', count: messages.length, pages, harvestCount: PAGE_SIZE * MAX_PAGES });
     }
   }
 
