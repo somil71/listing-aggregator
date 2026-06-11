@@ -1,5 +1,5 @@
 # ── Stage 1: Build React dashboard ────────────────────────────────────────
-FROM node:20-alpine AS dashboard-build
+FROM node:26-alpine AS dashboard-build
 
 WORKDIR /build/dashboard
 
@@ -14,7 +14,7 @@ COPY dashboard/ ./
 RUN npm run build
 
 # ── Stage 2: Production server ─────────────────────────────────────────────
-FROM node:20-alpine
+FROM node:26-alpine
 
 # Chromium dependencies for Puppeteer / whatsapp-web.js
 RUN apk add --no-cache \
