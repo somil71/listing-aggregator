@@ -24,6 +24,7 @@ RUN apk add --no-cache \
     harfbuzz \
     ca-certificates \
     ttf-freefont \
+    su-exec \
     && rm -rf /var/cache/apk/*
 
 # Tell Puppeteer to use the system Chromium instead of downloading its own
@@ -48,7 +49,13 @@ RUN mkdir -p data/db data/media data/wwebjs-auth logs reports \
     && adduser  -S nodejs -u 1001 \
     && chown -R nodejs:nodejs /app
 
-USER nodejs
+# Volume mounts (e.g. Railway's /app/data) arrive root-owned, so the container
+# starts as root: the entrypoint chowns the mount to nodejs and immediately
+# drops privileges via su-exec. No USER directive — the entrypoint enforces it.
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+ENTRYPOINT ["docker-entrypoint.sh"]
 
 EXPOSE 3000
 
